@@ -1,0 +1,9 @@
+*.a
+build/
+/evaluation/sapsq_dump
+*.log
+*.o
+*.pyc
+__pycache__/
+results/
+*.so

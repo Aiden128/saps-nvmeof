@@ -1,0 +1,180 @@
+mk/spdk.lib_deps.mk                 |  1 +
+ mk/spdk.modules.mk                  |  2 +-
+ module/bdev/Makefile                |  2 +-
+ module/bdev/error/vbdev_error.c     | 15 ++++++++
+ module/bdev/error/vbdev_error.h     | 10 ++++++
+ module/bdev/error/vbdev_error_rpc.c | 72 +++++++++++++++++++++++++++++++++++++
+ scripts/genrpc.py                   |  6 +++-
+ 7 files changed, 105 insertions(+), 3 deletions(-)
+
+--- Changes ---
+
+mk/spdk.lib_deps.mk
+  @@ -148,6 +148,7 @@ DEPDIRS-bdev_split := $(BDEV_DEPS)
+  +DEPDIRS-bdev_bimodal_delay := $(BDEV_DEPS_THREAD)
+   DEPDIRS-bdev_delay := $(BDEV_DEPS_THREAD)
+   DEPDIRS-bdev_error := $(BDEV_DEPS_THREAD)
+   DEPDIRS-bdev_iscsi := $(BDEV_DEPS_THREAD)
+  +1 -0
+
+mk/spdk.modules.mk
+  @@ -5,7 +5,7 @@
+  -BLOCKDEV_MODULES_LIST += bdev_raid bdev_error bdev_gpt bdev_split bdev_delay
+  +BLOCKDEV_MODULES_LIST += bdev_raid bdev_error bdev_gpt bdev_split bdev_delay bdev_bimodal_delay
+   BLOCKDEV_MODULES_LIST += bdev_zone_block
+   BLOCKDEV_MODULES_LIST += blob_bdev blob lvol vmd nvme
+   
+  +1 -1
+
+module/bdev/Makefile
+  @@ -6,7 +6,7 @@
+  -DIRS-y += delay error gpt lvol malloc null nvme passthru raid split zone_block
+  +DIRS-y += bimodal_delay delay error gpt lvol malloc null nvme passthru raid split zone_block
+   
+   DIRS-$(CONFIG_XNVME) += xnvme
+   
+  +1 -1
+
+module/bdev/error/vbdev_error.c
+  @@ -34,6 +34,9 @@ struct vbdev_error_info {
+  +	/* NVMe-specific error fields (used when error_type == VBDEV_IO_NVME_ERROR) */
+  +	uint8_t				nvme_sct;
+  +	uint8_t				nvme_sc;
+   };
+   
+   struct error_io {
+  @@ -137,6 +140,8 @@ vbdev_error_inject_error(char *name, const struct vbdev_error_inject_opts *opts)
+  +			error_disk->error_vector[i].nvme_sct = opts->nvme_sct;
+  +			error_disk->error_vector[i].nvme_sc = opts->nvme_sc;
+   		}
+   	} else if (0 == opts->io_type) {
+   		for (i = 0; i < SPDK_COUNTOF(error_disk->error_vector); i++) {
+  @@ -148,6 +153,8 @@ vbdev_error_inject_error(char *name, const struct vbdev_error_inject_opts *opts)
+  +		error_disk->error_vector[opts->io_type].nvme_sct = opts->nvme_sct;
+  +		error_disk->error_vector[opts->io_type].nvme_sc = opts->nvme_sc;
+   	}
+   
+   exit:
+  @@ -296,6 +303,14 @@ vbdev_error_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bde
+  +	case VBDEV_IO_NVME_ERROR:
+  +		/* Inject a specific NVMe sct/sc — used by D3 experiment to produce
+  +		 * sct=2/sc=0x81 (Unrecovered Read Error) or sct=3/sc=0x00 (Internal
+  +		 * Path Error) without modifying the underlying storage stack. */
+  +		spdk_bdev_io_complete_nvme_status(bdev_io, 0,
+  +						  error_disk->error_vector[bdev_io->type].nvme_sct,
+  +						  error_disk->error_vector[bdev_io->type].nvme_sc);
+  +		break;
+   	case VBDEV_IO_CORRUPT_DATA:
+   		if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+   			vbdev_error_corrupt_io_data(bdev_io,
+  +15 -0
+
+module/bdev/error/vbdev_error.h
+  @@ -16,6 +16,10 @@ enum vbdev_error_type {
+  +	/* Inject a specific NVMe status code (sct + sc). Lets D3 tests inject
+  +	 * sct=2/sc=0x81 (Unrecovered Read Error) vs sct=3/sc=0x00 (Internal
+  +	 * Path Error) to verify SAPS semantic classifier. */
+  +	VBDEV_IO_NVME_ERROR,
+   };
+   
+   typedef void (*spdk_delete_error_complete)(void *cb_arg, int bdeverrno);
+  @@ -46,6 +50,12 @@ struct vbdev_error_inject_opts {
+  +	/* Used when error_type == VBDEV_IO_NVME_ERROR to specify an exact
+  +	 * NVMe Status Code Type (sct) and Status Code (sc).
+  +	 * e.g. sct=2, nvme_sc=0x81 => Unrecovered Read Error
+  +	 *      sct=3, nvme_sc=0x00 => Internal Path Error */
+  +	uint8_t nvme_sct;
+  +	uint8_t nvme_sc;
+   };
+   
+   /**
+  +10 -0
+
+module/bdev/error/vbdev_error_rpc.c
+  @@ -153,3 +153,75 @@ cleanup:
+  +
+  +/*
+  + * bdev_error_inject_nvme_error — inject a specific NVMe sct/sc status code.
+  + *
+  + * This is a separate, lighter RPC that bypasses the autogen enum system and
+  + * lets callers specify numeric sct + sc directly.  Used by D3 experiment to
+  + * distinguish media errors (sct=2/sc=0x81) from path errors (sct=3/sc=0x00).
+  + *
+  + * Example:
+  + *   rpc.py bdev_error_inject_nvme_error --name EE_Null0 \
+  + *          --io_type read --num 1000 --sct 2 --sc 0x81
+  + */
+  +struct rpc_bdev_nvme_inject_ctx {
+  +	char		*name;
+  +	uint32_t	io_type;   /* decoded via rpc_error_bdev_decode_io_type */
+  +	uint32_t	num;
+  +	uint64_t	queue_depth;
+  +	uint8_t		sct;
+  +	uint8_t		sc;
+  +};
+  +
+  +static void
+  +free_rpc_bdev_nvme_inject(struct rpc_bdev_nvme_inject_ctx *r)
+  +{
+  +	free(r->name);
+  +}
+  +
+  +static const struct spdk_json_object_decoder rpc_bdev_error_inject_nvme_error_decoders[] = {
+  +	{"name",        offsetof(struct rpc_bdev_nvme_inject_ctx, name),        spdk_json_decode_string},
+  +	{"io_type",     offsetof(struct rpc_bdev_nvme_inject_ctx, io_type),     rpc_error_bdev_decode_io_type},
+  +	{"num",         offsetof(struct rpc_bdev_nvme_inject_ctx, num),         spdk_json_decode_uint32, true},
+  +	{"queue_depth", offsetof(struct rpc_bdev_nvme_inject_ctx, queue_depth), spdk_json_decode_uint64, true},
+  +	{"sct",         offsetof(struct rpc_bdev_nvme_inject_ctx, sct),         spdk_json_decode_uint8},
+  +	{"sc",          offsetof(struct rpc_bdev_nvme_inject_ctx, sc),          spdk_json_decode_uint8},
+  +};
+  +
+  +static void
+  +rpc_bdev_error_inject_nvme_error(struct spdk_jsonrpc_request *request,
+  +				 const struct spdk_json_val *params)
+  +{
+  +	struct rpc_bdev_nvme_inject_ctx req = {.num = 1};
+  +	struct vbdev_error_inject_opts opts = {};
+  +	int rc = 0;
+  +
+  +	if (spdk_json_decode_object(params, rpc_bdev_error_inject_nvme_error_decoders,
+  +				    SPDK_COUNTOF(rpc_bdev_error_inject_nvme_error_decoders), &req)) {
+  +		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+  +		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+  +						 "spdk_json_decode_object failed");
+  +		goto cleanup;
+  +	}
+  +
+  +	opts.io_type    = req.io_type;
+  +	opts.error_type = VBDEV_IO_NVME_ERROR;
+  +	opts.error_num  = req.num;
+  +	opts.error_qd   = req.queue_depth;
+  +	opts.nvme_sct   = req.sct;
+  +	opts.nvme_sc    = req.sc;
+  +
+  +	rc = vbdev_error_inject_error(req.name, &opts);
+  +	if (rc) {
+  +		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+  +		goto cleanup;
+  +	}
+  +
+  +	spdk_jsonrpc_send_bool_response(request, true);
+  +
+  +cleanup:
+  +	free_rpc_bdev_nvme_inject(&req);
+  +}
+  +SPDK_RPC_REGISTER("bdev_error_inject_nvme_error", rpc_bdev_error_inject_nvme_error,
+  +		  SPDK_RPC_RUNTIME)
+  +72 -0
+
+scripts/genrpc.py
+  @@ -41,7 +41,11 @@ def lint_c_code(schema: Dict[str, Any]) -> None:
+  -    exception_methods = {"nvmf_create_target", "nvmf_delete_target", "nvmf_get_targets"}
+  +    exception_methods = {"nvmf_create_target", "nvmf_delete_target", "nvmf_get_targets",
+  +                         # D3 experiment: NVMe sct/sc injection — hand-coded decoder, no autogen struct needed.
+  +                         "bdev_error_inject_nvme_error",
+  +                         # D4 experiment: bimodal delay bdev — hand-coded decoders, no autogen struct needed.
+  +                         "bdev_bimodal_delay_create", "bdev_bimodal_delay_update", "bdev_bimodal_delay_delete"}
+       # TODO: those are embeeded objects decoders and will be resolved soon
+       exceptions_decoders = {f"rpc_{name}_decoders" for name in schema_objects}
+       c_code_methods = dict()
+  +5 -1

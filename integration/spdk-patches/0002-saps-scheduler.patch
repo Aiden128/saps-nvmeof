@@ -1,0 +1,637 @@
+--- /tmp/dpa_plugin_dev.c.before	2026-04-22 14:24:03.592041236 +0800
++++ /home/user/DPA/nvme-of-controller/dpa-smart-initiator/flexio_build/samples/dpa_plugin/dev/dpa_plugin_dev.c	2026-04-22 14:29:29.496162440 +0800
+@@ -207,117 +207,118 @@
+  * ~1 sec at typical ~2 GHz host TSC (2^32 / 2e9 ≈ 2.1 s). */
+ static uint32_t g_submit_tsc_low[65536];
+ 
+-/* v2 SAPS per-path state (spec-v4.md §4.1). Indexed
+- * [qp_id & CONN_MASK][path_id & PATH_MASK].
++/* v2 SAPS per-path state (spec-v4.md §4.1, 2026-04-22 canonical).
++ * Indexed [qp_id & CONN_MASK][path_id & PATH_MASK].
+  *
+- * Upgrade from v1 (CUSUM-only) to v2 (pluggable detector, default NEWMA):
+- *   - Dropped:  cusum_pos (replaced by pluggable detector state)
+- *               err_count (coarse 50 ms sliding window replaced by
+- *                          err_hist[4][16] + err_rate_ewma)
+- *               degraded  (replaced by 4-state FSM)
+- *   - Added:    ewma_fast / ewma_slow   (NEWMA default detector, Keriven 2020)
+- *               err_hist[4][16]         (NVMe semantic error histogram)
+- *               err_rate_ewma           (error rate EWMA for FSM trigger)
+- *               opc_lat[3]              (per-opcode Welford: READ/WRITE/FLUSH)
+- *               state + state_entered_tsc + probe_count (FSM §4.4)
+- *   - Kept:     n, mean_log_lat, m2     (global log-latency Welford)
+- *               inflight                (QD tracking)
+- *               score                   (cached verdict)
+- *
+- * Footprint: spec §4.1 sizing: 1024 × 4 × 64 B = 256 KiB. Our struct runs
+- * 192 B (3 cachelines) because err_hist + opc_lat + qd_m2 expand past the
+- * single-cacheline budget the spec sketched. 1024 × 4 × 192 B = 768 KiB,
+- * still fits comfortably in BF-3 DPA 1.5 MiB L2 alongside g_conn (320 KiB)
+- * + submit_tsc_low (256 KiB) + ring (512 KiB) when sized at current
+- * DPA_PLUGIN_CONN_MAX. Spec §4.7 budget accounting unchanged (per-event
+- * cost dominates; static state is one-time allocation).
++ * v2-modern (this revision) diff from intermediate v2 pluggable-detector:
++ *   - REMOVED Welford mean_log_lat / m2 + fixed_isqrt — spec §4.3 scores
++ *                 directly from streaming P99, no Kingman variance proxy
++ *   - REMOVED pluggable detector_ops (cusum_ops / bocpd_ops / conformal_ops)
++ *                 — §4.6 says "no pluggable interface, no ablation candidate.
++ *                 NEWMA on log-lat is settled."
++ *   - ADDED   p99_estimate + frugal_count (global Frugal-2U streaming P99,
++ *             Ma/Muthukrishnan/Sandler ANALCO 2014) — §4.3 direct tail-aware
++ *   - ADDED   opc_p99[3] (per-opcode Frugal-2U P99) — §4.1 Chain E
++ *   - KEPT    ewma_fast / ewma_slow        (NEWMA on log-lat, §4.6)
++ *             err_hist[4][16], err_rate_ewma (semantic histogram, §4.5)
++ *             inflight + qd_mean + qd_m2  (QD trend)
++ *             state + state_entered_tsc + probe_count (FSM §4.4)
++ *             score                        (shadow of verdict table)
++ *
++ * Footprint: 64 B + 32 B (err_hist) + 24 B (opc_p99) + misc ≈ 192 B actual
++ * (3 cachelines). 1024 × 4 × 192 B = 768 KiB — fits 1.5 MiB L2 alongside
++ * g_conn (320 KiB, E1 admission) + submit_tsc_low (256 KiB) + ring (512 KiB).
+  *
+  * All fixed-point (Q16.16) — no FPU on DPA.
+  */
+ struct dpa_path_state {
+-	/* Welford global log-latency (§4.1) */
+-	uint64_t n;                        /* clean sample count */
+-	int64_t  mean_log_lat;             /* Q16.16 */
+-	int64_t  m2;                       /* Q32.32 scale sum-of-squared-deltas */
+-
+-	/* NEWMA detector state (§4.6 default detector) */
+-	int64_t  ewma_fast;                /* Q16.16 */
+-	int64_t  ewma_slow;                /* Q16.16 */
++	/* Clean sample count (§4.2 — retry_count==0 completions only). */
++	uint64_t n;
+ 
+-	/* Legacy CUSUM (kept so detector_ops=cusum can be selected for ablation) */
+-	int64_t  cusum_pos;                /* Q16.16 */
++	/* NEWMA detector state (§4.6, Keriven et al. NeurIPS 2020). */
++	int64_t  ewma_fast;                /* Q16.16 on log-latency */
++	int64_t  ewma_slow;                /* Q16.16 on log-latency */
++
++	/* Frugal-2U streaming P99 (§4.3, Ma/Muthukrishnan/Sandler ANALCO 2014).
++	 * p99_estimate tracked in Q16.16 log2-of-latency-ticks (same units as
++	 * ewma_{fast,slow}) so scoring can take 1/p99 directly without unit
++	 * conversion. frugal_step is Frugal-2U's adaptive step-doubling state. */
++	int64_t  p99_estimate;             /* Q16.16 log-lat */
++	int32_t  frugal_step;              /* Frugal-2U step (positive integer) */
++	int32_t  _pad_frugal;
+ 
+-	/* In-flight + QD Welford (§4.1 trend / QD penalty) */
++	/* In-flight + QD trend (used as score penalty, not primary signal). */
+ 	uint32_t inflight;
+-	uint32_t _pad0;
++	uint32_t _pad_inflight;
+ 	int64_t  qd_mean;                  /* Q16.16 */
+ 	int64_t  qd_m2;                    /* Q32.32 */
+ 
+-	/* Error histogram [sct 0..3][sc & 0xF] (§4.5 semantic classifier) */
++	/* Error histogram [sct 0..3][sc & 0xF] (§4.5 semantic classifier). */
+ 	uint16_t err_hist[4][16];          /* 128 B */
+ 	int64_t  err_rate_ewma;            /* Q16.16 */
+ 
+-	/* Per-opcode Welford (§4.1 Chain E) — index 0=READ(0x02),
+-	 * 1=WRITE(0x01), 2=FLUSH(0x00). We map via opc_bucket(). */
++	/* Per-opcode Frugal-2U P99 (§4.1 Chain E, opcode-aware scoring).
++	 * Index 0=READ(0x02), 1=WRITE(0x01), 2=FLUSH(0x00). */
+ 	struct {
+-		int64_t  mean;             /* Q16.16 */
+-		int64_t  m2;               /* Q32.32 */
+-		uint64_t n;
+-	} opc_lat[3];
++		int64_t  p99;              /* Q16.16 log-lat */
++		int32_t  frugal_step;
++		uint32_t n;
++	} opc_p99[3];
+ 
+-	/* FSM (§4.4) */
++	/* FSM (§4.4). */
+ 	uint16_t state;                    /* enum dpa_saps_state (0..3) */
+-	uint16_t _pad1;
++	uint16_t _pad_state;
+ 	uint32_t probe_count;              /* RECOVERING ε-probe count */
+ 	uint64_t state_entered_tsc;
+ 
+-	/* Last-event telemetry */
++	/* Last-event telemetry (debug aid; read by lease-renew trace). */
+ 	uint64_t last_complete_tsc;
+ 
+-	/* Cached verdict for SPDK read-side (shadows shared table) */
++	/* Cached verdict (shadows per_qp_path_score[qp][path]). */
+ 	uint32_t score;
+-	uint32_t _pad2;
++	uint32_t _pad_score;
+ } __attribute__((aligned(64)));
+ 
+ static struct dpa_path_state g_path[DPA_PLUGIN_CONN_MAX][DPA_PLUGIN_PATH_MAX];
+ 
+-/* v2 SAPS tunables (spec-v4 §4.1 / §4.3 / §4.4 / §4.6).
++/* v2 SAPS tunables (spec-v4 §4.1 / §4.3 / §4.4 / §4.6 — 2026-04-22 canonical).
++ *
++ * Scoring is direct 1/P99 — no Kingman variance proxy, no pluggable detector.
++ * Single algorithm stack: NEWMA on log-lat + Frugal-2U P99 + semantic classifier
++ * + FSM with hysteresis.
+  *
+  * Score space (§4.3):
+  *   SCALE = 1<<20 (Q4.20). Score ∈ [1..SCALE]. Never 0 for HEALTHY/DEGRADING
+  *   paths so bdev_nvme argmax always has a winner; EXCLUDED and RECOVERING
+  *   (non-probe) paths clamp to 1 to preserve ε-probe opportunity.
+  *
+- * NEWMA (§4.6, Keriven NeurIPS 2020):
+- *   LAMBDA_FAST = 0.1 × (1<<16) = 6553  — fast learner tracks short-term mean
+- *   LAMBDA_SLOW = 0.01 × (1<<16) = 655  — slow learner tracks long-term mean
+- *   H_NEWMA     = 0.5 × (1<<16) = 32768 — distance threshold before CHANGED
+- *                 fires. Tune in D2 ablation; §4.4 comment "tune per ablation".
+- *   WARMUP_N    = 32                    — §4.2: no detection until n > WARMUP
+- *
+- * Legacy CUSUM (§4.6 legacy baseline — kept for ablation):
+- *   CUSUM_DRIFT_Q16 = 0.5 × (1<<16) = 32768
+- *   CUSUM_THRESH_Q16 = 5.0 × (1<<16) = 327680
+- *
+- * Kingman scoring (§4.3):
+- *   K_VAR = 4  — variance weight in base = SCALE / (mean + K_VAR · stddev)
+- *   W_ERR = 20 — err_rate_ewma penalty
+- *   W_QD  = 1  — inflight penalty (per outstanding IO)
++ * NEWMA (§4.6, Keriven/Garreau/Poli NeurIPS 2020):
++ *   LAMBDA_FAST = 0.1 × (1<<16) = 6553
++ *   LAMBDA_SLOW = 0.01 × (1<<16) = 655
++ *   H_NEWMA     = 0.5 × (1<<16) = 32768   — distance threshold
++ *   WARMUP_N    = 32                      — no detection until n > WARMUP
++ *
++ * Frugal-2U (§4.3, Ma/Muthukrishnan/Sandler ANALCO 2014):
++ *   TARGET_P99_NUM / TARGET_P99_DEN = 99/100 — nominal quantile
++ *   PRNG_MASK = 0xFF (256-step). update prob for Frugal-1U up step = 1%.
++ *   Frugal-2U step-double when consecutive same-direction updates,
++ *   reset step to 1 on direction flip.
+  *
+  * FSM hysteresis (§4.4):
+- *   E_HI  = 0.05 × (1<<16) = 3277  — err_rate_ewma threshold for HEALTHY→DEGRADING
+- *   E_LO  = 0.01 × (1<<16) = 655   — err_rate_ewma for DEGRADING→HEALTHY
+- *   T_DEG_TICKS = 500 ms           — DEGRADING→EXCLUDED hold
+- *   T_RECOVER_TICKS = 100 ms        — DEGRADING→HEALTHY stable window
+- *   T_EXCLUDE_TICKS = 1 s           — EXCLUDED→RECOVERING cool-down
+- *   N_PROBE = 30                   — RECOVERING→HEALTHY consecutive healthy probes
+- *   ERR_ALPHA_Q16 = (1<<16)/32 = 2048  — α = 1/32 for err_rate_ewma
++ *   E_HI  = 0.05 × (1<<16) = 3277
++ *   E_LO  = 0.01 × (1<<16) = 655
++ *   T_DEG_TICKS     = 500 ms
++ *   T_RECOVER_TICKS = 100 ms
++ *   T_EXCLUDE_TICKS = 1 s
++ *   N_PROBE = 30
++ *   ERR_ALPHA_Q16 = (1<<16)/32 = 2048      — α = 1/32 for err_rate_ewma
++ *
++ * Score weights (§4.3):
++ *   W_ERR = 20  — err_rate_ewma penalty
++ *   W_QD  = 1   — inflight penalty (per outstanding IO)
+  *
+  * Wall-clock (DPA TSC @ 1.5 GHz):
+- *   TICKS_PER_MS   = 1_500_000
+- *   T_DEG          = 500 × TICKS_PER_MS
+- *   T_RECOVER      = 100 × TICKS_PER_MS
+- *   T_EXCLUDE      = 1000 × TICKS_PER_MS
++ *   TICKS_PER_MS = 1_500_000
+  */
+ #define SAPS_SCORE_SCALE       (1u << 20)
+ #define SAPS_SCORE_MAX         SAPS_SCORE_SCALE
+@@ -326,9 +327,12 @@
+ #define SAPS_LAMBDA_FAST_Q16   6553       /* 0.1 */
+ #define SAPS_LAMBDA_SLOW_Q16   655        /* 0.01 */
+ #define SAPS_H_NEWMA_Q16       32768      /* 0.5 */
+-#define SAPS_CUSUM_DRIFT_Q16   32768      /* 0.5 — legacy CUSUM */
+-#define SAPS_CUSUM_THRESH_Q16  327680     /* 5.0 — legacy CUSUM */
+-#define SAPS_K_VAR             4u
++
++/* Frugal-2U: target quantile = 99% expressed over a 256-step PRNG output.
++ * up_threshold_q8 / 256 ≈ 1 - 0.99 = 0.01 → 3/256 ≈ 1.17%.
++ * Complement for down step: (256 - 3)/256 ≈ 98.83%. */
++#define SAPS_FRUGAL_UP_Q8      3u
++
+ #define SAPS_W_ERR             20u
+ #define SAPS_W_QD              1u
+ #define SAPS_E_HI_Q16          3277       /* 0.05 */
+@@ -398,29 +402,13 @@
+ 	return int_part + frac_part;
+ }
+ 
+-/* Integer sqrt for Q32.32-scale inputs; Newton iteration, 6 rounds is enough
+- * for 32-bit-range inputs. Returns floor(sqrt(x)). */
+-static inline int64_t fixed_isqrt(int64_t x)
+-{
+-	if (x <= 0)
+-		return 0;
+-	/* Seed with 2^(bitlen/2). */
+-	unsigned bl = 64u - (unsigned)__builtin_clzll((uint64_t)x);
+-	int64_t r = (int64_t)1 << ((bl + 1u) / 2u);
+-	for (int i = 0; i < 6; i++) {
+-		int64_t q = x / r;
+-		r = (r + q) >> 1;
+-	}
+-	return r;
+-}
+-
+ /* v2 SAPS helpers (spec-v4 §4.1 / §4.3 / §4.4 / §4.5 / §4.6). */
+ 
+ /* Absolute value for signed 64-bit. */
+ static inline int64_t abs64(int64_t x) { return x < 0 ? -x : x; }
+ 
+ /* Fixed-point inverse (Q16.16): returns (1<<16) / x if x > 0, else 0.
+- * Caller should multiply with Q16.16 number to keep Q16.16 scale. */
++ * Caller multiplies with Q16.16 number to keep Q16.16 scale. */
+ static inline int64_t fixed_inv_q16(int64_t x)
+ {
+ 	if (x <= 0)
+@@ -428,7 +416,7 @@
+ 	return ((int64_t)1 << 32) / x;   /* (1<<16)<<16 / x gives Q16.16 result */
+ }
+ 
+-/* Map NVMe opcode to per-opcode Welford slot.
++/* Map NVMe opcode to per-opcode Frugal-2U slot.
+  *   opc 0x02 = READ   → 0
+  *   opc 0x01 = WRITE  → 1
+  *   opc 0x00 = FLUSH  → 2
+@@ -443,6 +431,65 @@
+ 	}
+ }
+ 
++/* Branchless 8-bit xorshift PRNG for Frugal-2U random step.
++ * State is per-call so we avoid a global mutable seed (which would require
++ * fencing across events). Seed comes from the sample itself + a small
++ * rotating counter — good enough for Bernoulli(1%) sampling. */
++static inline uint8_t frugal_rand8(uint64_t seed)
++{
++	seed ^= seed << 13;
++	seed ^= seed >> 7;
++	seed ^= seed << 17;
++	return (uint8_t)(seed & 0xFFu);
++}
++
++/* §4.3 Frugal-2U streaming quantile estimator (Ma/Muthukrishnan/Sandler 2014).
++ *
++ * Updates a P99 estimator with log-lat sample x. Frugal-2U augments Frugal-1U
++ * with a step-doubling heuristic: consecutive same-direction updates double the
++ * step for faster convergence, direction flip resets step to 1.
++ *
++ *   Pr(step up  | x > est) = 1 - q   (= 1 - 0.99 ≈ SAPS_FRUGAL_UP_Q8/256)
++ *   Pr(step dn  | x < est) = q       (= 0.99      ≈ (256 - SAPS_FRUGAL_UP_Q8)/256)
++ *
++ * Step is signed in the caller's *frugal_step scratch. For P99, the steady
++ * state has far more "x < est" events than "x > est" (99:1 ratio), so without
++ * step-doubling the downward drift of est during stable periods dominates.
++ * Step doubling is engaged only on consecutive up-moves (the rare event) so
++ * the estimator climbs fast after a true shift upward.
++ *
++ * Both x and *est are in the same Q16.16 log-lat units. */
++static inline void frugal2u_update(int64_t *est, int32_t *step,
++				    int64_t x, uint64_t prng_seed)
++{
++	uint8_t rv = frugal_rand8(prng_seed);
++
++	if (x > *est) {
++		if (rv < SAPS_FRUGAL_UP_Q8) {
++			int32_t s = *step;
++			if (s <= 0) s = 1;
++			*est += (int64_t)s;
++			*step = (s < 0x40000000) ? (s + 1) : s;
++		} else {
++			/* Direction flip — reset step toward 1. */
++			if (*step > 1) *step = 1;
++		}
++	} else if (x < *est) {
++		if (rv >= SAPS_FRUGAL_UP_Q8) {
++			int32_t s = *step;
++			if (s <= 0) s = 1;
++			*est -= (int64_t)s;
++			if (*est < 0) *est = 0;
++			/* Down-moves are the common case at P99 — step stays
++			 * modest so we don't oscillate past the true quantile
++			 * on a single outlier bin. */
++		} else {
++			if (*step > 1) *step = 1;
++		}
++	}
++	/* x == *est: no update. */
++}
++
+ /* §4.5 NVMe semantic classifier — map (sct, sc) → action verdict.
+  * Returns enum dpa_saps_action value (0..3) or UNSET for non-error / unmapped.
+  *
+@@ -460,6 +507,7 @@
+ 		if (sc == 0x86) return DPA_SAPS_ACTION_NOT_ERROR;  /* Deallocated block */
+ 		return DPA_SAPS_ACTION_TERMINAL;                    /* other media → terminal */
+ 	case 3:   /* Path Related */
++		if (sc == 0x04) return DPA_SAPS_ACTION_RETRY_SAME; /* Host Pathing — local issue */
+ 		if (sc == 0x01) return DPA_SAPS_ACTION_FAILOVER;   /* Asym. Persistent Loss */
+ 		return DPA_SAPS_ACTION_FAILOVER;                    /* other path → failover */
+ 	default:
+@@ -468,36 +516,14 @@
+ 	return DPA_SAPS_ACTION_UNSET;
+ }
+ 
+-/* §4.6 Pluggable detector interface.
++/* §4.6 NEWMA on log-latency — the single change-point detector.
++ * Dual-EWMA distance test (Keriven/Garreau/Poli NeurIPS 2020).
+  *
+- * DPA kernel calls ops->on_sample(state, log_lat) after each clean latency
+- * sample. Returns true when a change-point is detected (triggers FSM
+- * HEALTHY→DEGRADING in §4.4).
+- *
+- * NEWMA (default) uses the dual-EWMA fields already in dpa_path_state
+- * (ewma_fast / ewma_slow). CUSUM (legacy) uses cusum_pos. BOCPD and
+- * Conformal are ablation stubs that return false for now (~200 ns/event
+- * would require dedicated state arrays; see spec §4.6 notes — ablation
+- * plumbing is the contribution of this change, full impl is a follow-up).
+- *
+- * The detector selection is compile-time: DPA_DETECTOR={NEWMA,CUSUM,
+- * BOCPD,CONFORMAL}. Default NEWMA. Switching requires rebuild + DPA
+- * kernel re-flash; runtime switching is intentionally excluded to keep
+- * the hot path branch-free.
+- */
+-struct detector_ops {
+-	void (*init)(struct dpa_path_state *p);
+-	bool (*on_sample)(struct dpa_path_state *p, int64_t log_lat);
+-	void (*reset)(struct dpa_path_state *p);
+-};
+-
+-static void newma_init(struct dpa_path_state *p)
+-{
+-	p->ewma_fast = 0;
+-	p->ewma_slow = 0;
+-}
+-
+-static bool newma_on_sample(struct dpa_path_state *p, int64_t log_lat)
++ * Returns true once warmup is past and |fast - slow| exceeds H_NEWMA.
++ * Caller also owns resetting ewma_fast/ewma_slow when the FSM transitions
++ * through a state that logically starts a new observation window — we reset
++ * toward the most recent slow EWMA so the two don't immediately re-fire. */
++static inline bool newma_on_sample(struct dpa_path_state *p, int64_t log_lat)
+ {
+ 	/* Q16.16 arithmetic: λ·(x - EWMA) >> 16 keeps scale. */
+ 	p->ewma_fast += ((log_lat - p->ewma_fast) * SAPS_LAMBDA_FAST_Q16) >> 16;
+@@ -507,133 +533,58 @@
+ 	return abs64(p->ewma_fast - p->ewma_slow) > SAPS_H_NEWMA_Q16;
+ }
+ 
+-static void newma_reset(struct dpa_path_state *p)
++static inline void newma_reset(struct dpa_path_state *p)
+ {
+-	/* Keep current sample mean as the new post-change baseline so the two
+-	 * EWMAs converge rather than re-firing immediately. */
+-	p->ewma_fast = p->mean_log_lat;
+-	p->ewma_slow = p->mean_log_lat;
+-}
+-
+-static void cusum_init(struct dpa_path_state *p) { p->cusum_pos = 0; }
+-
+-static bool cusum_on_sample(struct dpa_path_state *p, int64_t log_lat)
+-{
+-	if (p->n < SAPS_WARMUP_N)
+-		return false;
+-	/* Page CUSUM on positive residual vs current Welford mean. */
+-	int64_t delta = log_lat - p->mean_log_lat;
+-	p->cusum_pos += delta - SAPS_CUSUM_DRIFT_Q16;
+-	if (p->cusum_pos < 0)
+-		p->cusum_pos = 0;
+-	if (p->cusum_pos > SAPS_CUSUM_THRESH_Q16) {
+-		p->cusum_pos = 0;
+-		return true;
+-	}
+-	return false;
++	/* Anchor both EWMAs to current slow value so post-transition samples
++	 * measure residual from the just-established baseline, not the
++	 * pre-change drift. */
++	p->ewma_fast = p->ewma_slow;
+ }
+ 
+-static void cusum_reset(struct dpa_path_state *p) { p->cusum_pos = 0; }
+-
+-/* BOCPD-Prune / Conformal Martingale — ablation stubs. Full implementations
+- * (Turner 2013 / Volkhonskiy 2019) need run-length posterior arrays / rank
+- * windows that exceed 64 B per path. Land the detector_ops plumbing first;
+- * fill in state expansion as separate follow-up. */
+-static void bocpd_init(struct dpa_path_state *p) { (void)p; }
+-static bool bocpd_on_sample(struct dpa_path_state *p, int64_t log_lat)
+-{ (void)p; (void)log_lat; return false; }
+-static void bocpd_reset(struct dpa_path_state *p) { (void)p; }
+-
+-static void conformal_init(struct dpa_path_state *p) { (void)p; }
+-static bool conformal_on_sample(struct dpa_path_state *p, int64_t log_lat)
+-{ (void)p; (void)log_lat; return false; }
+-static void conformal_reset(struct dpa_path_state *p) { (void)p; }
+-
+-/* __attribute__((used)) keeps the non-selected ablation detectors linked so
+- * that swapping via -DDPA_DETECTOR=... is a one-flag rebuild. Without this,
+- * -Werror=unused-const-variable kills the build under the default selection. */
+-static const struct detector_ops newma_ops __attribute__((used)) = {
+-	.init = newma_init, .on_sample = newma_on_sample, .reset = newma_reset
+-};
+-static const struct detector_ops cusum_ops __attribute__((used)) = {
+-	.init = cusum_init, .on_sample = cusum_on_sample, .reset = cusum_reset
+-};
+-static const struct detector_ops bocpd_ops __attribute__((used)) = {
+-	.init = bocpd_init, .on_sample = bocpd_on_sample, .reset = bocpd_reset
+-};
+-static const struct detector_ops conformal_ops __attribute__((used)) = {
+-	.init = conformal_init, .on_sample = conformal_on_sample, .reset = conformal_reset
+-};
+-
+-/* Default detector = NEWMA (§4.6). Compile-time override via -DDPA_DETECTOR=X
+- * where X is one of NEWMA / CUSUM / BOCPD / CONFORMAL.
++/* §4.3 direct P99 scoring — no Kingman variance proxy.
+  *
+- * These ID constants are defined BEFORE the select macro so the preprocessor
+- * substitutes them before expanding the ?: chain. Do not reorder. */
+-#define DPA_DETECTOR_NEWMA     1
+-#define DPA_DETECTOR_CUSUM     2
+-#define DPA_DETECTOR_BOCPD     3
+-#define DPA_DETECTOR_CONFORMAL 4
+-
+-#ifndef DPA_DETECTOR
+-#define DPA_DETECTOR DPA_DETECTOR_NEWMA
+-#endif
+-
+-#if   DPA_DETECTOR == DPA_DETECTOR_NEWMA
+-static const struct detector_ops *g_detector = &newma_ops;
+-#elif DPA_DETECTOR == DPA_DETECTOR_CUSUM
+-static const struct detector_ops *g_detector = &cusum_ops;
+-#elif DPA_DETECTOR == DPA_DETECTOR_BOCPD
+-static const struct detector_ops *g_detector = &bocpd_ops;
+-#elif DPA_DETECTOR == DPA_DETECTOR_CONFORMAL
+-static const struct detector_ops *g_detector = &conformal_ops;
+-#else
+-#error "Unknown DPA_DETECTOR — must be one of NEWMA/CUSUM/BOCPD/CONFORMAL"
+-#endif
+-
+-/* §4.3 variance-aware Kingman-style score. All fixed-point Q16.16.
+- *
+- *   base     = SCALE / (mean_log_lat + K_VAR · stddev)
+- *   opc_boost scales by 1 / mean_opcode_latency to prefer paths that are
+- *             historically fast for *this* opcode specifically.
+- *   penalties subtract: err_rate_ewma · W_ERR + inflight · W_QD
++ *   base      = SCALE_q16 / p99                 (1/P99 base signal)
++ *   opc_boost = SCALE_q16 / opc_p99[opcode]    (per-opcode tail signal)
++ *   total     = (base * opc_boost) >> 16 − err_pen − qd_pen
+  *
+- * Score clamped to [SAPS_SCORE_MIN, SAPS_SCORE_MAX] = [1, 2^20]. */
++ * All latency quantiles are in Q16.16 log-lat (bits above baseline). Lower
++ * log-lat ⇒ higher score. Unused paths (n < WARMUP) return neutral score so
++ * argmax doesn't lock onto a single warm path during boot. */
+ static inline uint32_t compute_score(struct dpa_path_state *p, uint8_t opcode)
+ {
+ 	if (p->state == DPA_SAPS_STATE_EXCLUDED)
+-		return SAPS_SCORE_MIN;   /* preserve ε-probe slot */
++		return SAPS_SCORE_MIN;                    /* preserve ε-probe */
+ 	if (p->state == DPA_SAPS_STATE_RECOVERING && p->probe_count == 0)
+-		return SAPS_SCORE_MIN;   /* non-probe IOs avoid this path */
++		return SAPS_SCORE_MIN;                    /* non-probe IOs avoid */
+ 
+ 	if (p->n < SAPS_WARMUP_N)
+-		return SAPS_SCORE_SCALE / 2;   /* neutral warmup score */
++		return SAPS_SCORE_SCALE / 2;              /* neutral warmup */
+ 
+-	/* Welford variance → stddev in Q16.16. m2 is Q32.32 scale so divide
+-	 * by (n-1) keeps Q32.32, sqrt reduces to Q16.16. */
+-	int64_t variance = p->m2 / (int64_t)(p->n - 1);
+-	int64_t stddev = fixed_isqrt(variance);
+-
+-	/* Denominator: mean + K·stddev, both Q16.16. */
+-	int64_t denom = p->mean_log_lat + (int64_t)SAPS_K_VAR * stddev;
+-	if (denom <= 0)
+-		denom = 1;
+-	int64_t base = (int64_t)SAPS_SCORE_SCALE * ((int64_t)1 << 16) / denom;
++	/* Base: 1 / p99_estimate. p99 is Q16.16; base in Q16.16 units. */
++	int64_t p99 = p->p99_estimate;
++	if (p99 <= 0) p99 = 1;
++	int64_t base = fixed_inv_q16(p99);
++	if (base == 0) base = 1;
+ 
+-	/* Per-opcode boost: inverse of opcode mean latency (Q16.16).
+-	 * If opcode Welford warming up, skip boost (multiplier = 1). */
++	/* Per-opcode tail boost. If opcode Frugal-2U still warming, fall back
++	 * to identity multiplier (Q16.16 1.0). */
+ 	unsigned bucket = opc_bucket(opcode);
+-	int64_t opc_mean = p->opc_lat[bucket].mean;
+-	int64_t opc_boost_q16 = (int64_t)1 << 16;   /* identity */
+-	if (p->opc_lat[bucket].n > SAPS_WARMUP_N && opc_mean > 0) {
+-		opc_boost_q16 = fixed_inv_q16(opc_mean);
++	int64_t opc_p99 = p->opc_p99[bucket].p99;
++	int64_t opc_boost_q16 = (int64_t)1 << 16;     /* identity */
++	if (p->opc_p99[bucket].n > SAPS_WARMUP_N && opc_p99 > 0) {
++		opc_boost_q16 = fixed_inv_q16(opc_p99);
+ 		if (opc_boost_q16 == 0)
+ 			opc_boost_q16 = (int64_t)1 << 16;
+ 	}
+-	int64_t boosted = (base * opc_boost_q16) >> 16;
+ 
+-	/* Penalties (integer domain — err_rate_ewma is Q16.16, scale down
+-	 * before multiplying with W_ERR to keep penalty bounded). */
++	/* Combine base × opc_boost in Q16.16, then rescale to SAPS_SCORE_SCALE.
++	 * base is Q16.16, opc_boost is Q16.16 → product is Q32.32, >>16 ⇒ Q16.16.
++	 * Multiply by SCORE_SCALE (≈ Q4.20) after dividing by 1<<16 to normalise. */
++	int64_t combined = (base * opc_boost_q16) >> 16;       /* Q16.16 */
++	int64_t boosted  = (combined * (int64_t)SAPS_SCORE_SCALE) >> 16;  /* integer */
++
++	/* Penalties (integer domain). err_rate_ewma is Q16.16 scaled down
++	 * before multiplying with W_ERR to keep penalty bounded. */
+ 	int64_t err_pen = (p->err_rate_ewma * (int64_t)SAPS_W_ERR) >> 16;
+ 	int64_t qd_pen  = (int64_t)p->inflight * SAPS_W_QD;
+ 
+@@ -692,12 +643,13 @@
+ 	if (new_state != p->state) {
+ 		p->state = new_state;
+ 		p->state_entered_tsc = now_tsc;
+-		/* On entering HEALTHY from DEGRADING/RECOVERING, reset detector
++		/* On entering HEALTHY from DEGRADING/RECOVERING, reset NEWMA
+ 		 * so leftover ewma_fast/ewma_slow drift doesn't immediately
+-		 * re-fire. */
++		 * re-fire. Same treatment on DEGRADING entry keeps the detector
++		 * from getting stuck in a triggered state after a single blip. */
+ 		if (new_state == DPA_SAPS_STATE_HEALTHY ||
+ 		    new_state == DPA_SAPS_STATE_DEGRADING)
+-			g_detector->reset(p);
++			newma_reset(p);
+ 	}
+ }
+ 
+@@ -749,27 +701,28 @@
+ 	int64_t log_lat = fixed_log2((uint64_t)delta_ticks);
+ 
+ 	/* 1. Clean sample filter (§4.2): only retry_count==0 feeds statistics
+-	 *    and detector. Retries skew the mean and defeat change-point
+-	 *    detection — they're signals in their own right (error histogram
+-	 *    below), not latency samples. */
++	 *    and detector. Retries skew P99 and defeat change-point detection —
++	 *    they're signals in their own right (error histogram below), not
++	 *    latency samples. */
+ 	if (retry_count == 0) {
+-		/* Global Welford online update. */
+ 		p->n++;
+-		int64_t delta = log_lat - p->mean_log_lat;
+-		p->mean_log_lat += delta / (int64_t)p->n;
+-		int64_t delta2 = log_lat - p->mean_log_lat;
+-		p->m2 += delta * delta2;
+ 
+-		/* Detector (default NEWMA). */
+-		detector_changed = g_detector->on_sample(p, log_lat);
++		/* NEWMA change-point detector (§4.6). */
++		detector_changed = newma_on_sample(p, log_lat);
++
++		/* Global Frugal-2U P99 (§4.3). PRNG seed rotates per-sample
++		 * combining host_tsc and sample index so we get uncorrelated
++		 * Bernoulli draws across paths. */
++		uint64_t seed = host_tsc ^ (p->n * 0x9E3779B97F4A7C15ull);
++		frugal2u_update(&p->p99_estimate, &p->frugal_step, log_lat, seed);
+ 
+-		/* Per-opcode Welford. */
++		/* Per-opcode Frugal-2U (§4.1 Chain E). */
+ 		unsigned bucket = opc_bucket(opcode);
+-		p->opc_lat[bucket].n++;
+-		int64_t od = log_lat - p->opc_lat[bucket].mean;
+-		p->opc_lat[bucket].mean += od / (int64_t)p->opc_lat[bucket].n;
+-		int64_t od2 = log_lat - p->opc_lat[bucket].mean;
+-		p->opc_lat[bucket].m2 += od * od2;
++		p->opc_p99[bucket].n++;
++		uint64_t seed_opc = seed ^ ((uint64_t)(bucket + 1) << 32);
++		frugal2u_update(&p->opc_p99[bucket].p99,
++				&p->opc_p99[bucket].frugal_step,
++				log_lat, seed_opc);
+ 	}
+ 
+ 	/* 2. NVMe semantic classification (§4.5). sct_sc is packed as
+app/nvmf_tgt/Makefile | 12 ++++++++++++
+ mk/spdk.common.mk     |  7 +++++++
+ 2 files changed, 19 insertions(+)
+
+--- Changes ---
+
+app/nvmf_tgt/Makefile
+  @@ -21,6 +21,18 @@ ifeq ($(OS),Linux)
+  +# Link DPA plugin stub so nvmf_tgt resolves symbols from DPA-enabled libspdk_nvme.a.
+  +# Only needed when bdev_nvme / nvme_rdma were built with -DDPA_PLUGIN_ENABLED.
+  +# Point at the flexio samples build output directly (thin archive → can't copy).
+  +DPA_PLUGIN ?= 0
+  +ifeq ($(DPA_PLUGIN),1)
+  +DPA_PLUGIN_BUILD_DIR := /home/user/DPA/nvme-of-controller/dpa-smart-initiator/flexio_build/samples/build/dpa_plugin
+  +SYS_LIBS += $(DPA_PLUGIN_BUILD_DIR)/host/libdpa_plugin.a
+  +SYS_LIBS += $(DPA_PLUGIN_BUILD_DIR)/dev/dpa_plugin_app.a
+  +SYS_LIBS += $(DPA_PLUGIN_BUILD_DIR)/../common/host/libcommon_host.a
+  +SYS_LIBS += -L/opt/mellanox/flexio/lib -lflexio -libverbs -lmlx5 -lpthread
+  +endif
+  +
+   include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
+   
+   install: $(APP)
+  +12 -0
+
+mk/spdk.common.mk
+  @@ -165,6 +165,13 @@ ifeq ($(CONFIG_RDMA),y)
+  +# DPDK built against libarchive — firmware_read symbol comes from archive(3).
+  +# Detect via pkg-config so stock builds work on systems where DPDK picked up
+  +# libarchive support at configure time.
+  +ifeq ($(shell pkg-config --exists libarchive && echo y),y)
+  +SYS_LIBS += $(shell pkg-config --libs libarchive)
+  +endif
+  +
+   ifeq ($(CONFIG_URING),y)
+   SYS_LIBS += -luring
+   ifneq ($(strip $(CONFIG_URING_PATH)),)
+  +7 -0

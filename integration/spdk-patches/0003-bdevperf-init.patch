@@ -1,0 +1,59 @@
+examples/bdev/bdevperf/Makefile   | 16 ++++++++++++++++
+ examples/bdev/bdevperf/bdevperf.c | 18 ++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+--- Changes ---
+
+examples/bdev/bdevperf/Makefile
+  @@ -21,4 +21,20 @@ ifeq ($(SPDK_ROOT_DIR)/lib/env_dpdk,$(CONFIG_ENV))
+  +# S4: DPA plugin integration — compile-time gated, mirrors perf.c pattern.
+  +# Enable by: make DPA_PLUGIN=1
+  +# Requires libdpa_plugin.a built at:
+  +#   /home/user/DPA/nvme-of-controller/dpa-smart-initiator/flexio_build/samples/build/dpa_plugin/host/libdpa_plugin.a
+  +DPA_PLUGIN ?= 0
+  +ifeq ($(DPA_PLUGIN),1)
+  +DPA_PLUGIN_DIR := /home/user/DPA/nvme-of-controller/dpa-smart-initiator/flexio_build/samples/dpa_plugin
+  +DPA_PLUGIN_BUILD_DIR := /home/user/DPA/nvme-of-controller/dpa-smart-initiator/flexio_build/samples/build/dpa_plugin
+  +DPA_COMMON_HOST_O := /home/user/DPA/nvme-of-controller/dpa-smart-initiator/flexio_build/samples/build/common/host/libcommon_host.a
+  +CFLAGS  += -DDPA_PLUGIN_ENABLED -I$(DPA_PLUGIN_DIR)
+  +SYS_LIBS += $(DPA_PLUGIN_BUILD_DIR)/host/libdpa_plugin.a
+  +SYS_LIBS += $(DPA_PLUGIN_BUILD_DIR)/dev/dpa_plugin_app.a
+  +SYS_LIBS += $(DPA_COMMON_HOST_O)
+  +SYS_LIBS += -L/opt/mellanox/flexio/lib -lflexio -libverbs -lmlx5 -lpthread
+  +endif
+  +
+   include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
+  +16 -0
+
+examples/bdev/bdevperf/bdevperf.c
+  @@ -22,6 +22,10 @@
+  +#ifdef DPA_PLUGIN_ENABLED
+  +#include "dpa_plugin.h"   /* S4 host-side plugin API (init/shutdown) */
+  +#endif
+  +
+   #define BDEVPERF_CONFIG_MAX_FILENAME 1024
+   #define BDEVPERF_CONFIG_UNDEFINED -1
+   #define BDEVPERF_CONFIG_ERROR -2
+  @@ -2657,6 +2661,16 @@ bdevperf_run(void *arg1)
+  +#ifdef DPA_PLUGIN_ENABLED
+  +	/* S4: start DPA coordinator — ring + DPA polling kernel.
+  +	 * Called after SPDK env/bdev subsystem is up, before first IO.
+  +	 * Non-fatal: failures only lose per-path score data (SAPS falls back
+  +	 * to ACTIVE_PASSIVE); the rest of bdevperf continues normally. */
+  +	if (dpa_plugin_init() != 0) {
+  +		fprintf(stderr, "dpa_plugin_init failed — continuing without plugin\n");
+  +	}
+  +#endif
+  +
+   	if (g_wait_for_tests) {
+   		/* Do not perform any tests until RPC is received */
+   		return;
+  @@ -3088,6 +3102,10 @@ main(int argc, char **argv)
+  +#ifdef DPA_PLUGIN_ENABLED
+  +	dpa_plugin_shutdown();
+  +#endif
+  +
+   	spdk_app_fini();
+   	bdevperf_fini();
+   	return rc;
+  +18 -0

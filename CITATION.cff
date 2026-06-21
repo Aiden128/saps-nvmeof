@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "SAPS: Semantics-Aware Path Steering for Disaggregated NVMe-over-Fabrics on the SmartNIC Datapath (artifact)"
+type: software
+authors:
+  - family-names: Huang
+    given-names: Yong-Xuan
+    affiliation: National Tsing Hua University
+  - family-names: Chen
+    given-names: Ming-Hung
+    affiliation: IBM Research
+  - family-names: Chung
+    given-names: I-Hsin
+    affiliation: IBM Research
+  - family-names: Chou
+    given-names: Jerry
+    affiliation: National Tsing Hua University
+license: Apache-2.0
+preferred-citation:
+  type: article
+  title: "SAPS: Semantics-Aware Path Steering for Disaggregated NVMe-over-Fabrics on the SmartNIC Datapath"
+  authors:
+    - family-names: Huang
+      given-names: Yong-Xuan
+      affiliation: National Tsing Hua University
+    - family-names: Chen
+      given-names: Ming-Hung
+      affiliation: IBM Research
+    - family-names: Chung
+      given-names: I-Hsin
+      affiliation: IBM Research
+    - family-names: Chou
+      given-names: Jerry
+      affiliation: National Tsing Hua University
+  journal: "Future Generation Computer Systems"
+  year: 2026
+  notes: "Under review."
