@@ -50,8 +50,8 @@
  *     last_change_tsc         =   8
  *     qp_id, ns_id, reserved  =   8
  *     Raw = 196; with align(64) the allocator rounds to 256 (4 cachelines).
- *   Total @ N=1000 conn: 256 KiB conn_stats + 256 KiB submit_tsc_low
- *     (uint32_t submit_tsc_low[65536] direct-map by cmd_id). Plus the
+ *   Total @ N=1000 conn: 256 KiB conn_stats + 512 KiB submit_tsc_low
+ *     (direct-map by tenant, path, and cmd_id). Plus the
  *     512 KiB notify ring → 1.0 MiB, within BF-3 DPA 1.5 MiB L2.
  *
  *   NO FPU on DPA — log10 is approximated from bit-length (__builtin_clzll)
@@ -68,6 +68,13 @@
 #include <stdbool.h>
 #include <dpaintrin.h>
 #include "../dpa_plugin_com.h"
+
+/* Hot-loop diagnostic prints measurably perturb RPC setup and scheduler
+ * cadence on the real DPA. Keep them available for a diagnostic build, but
+ * disable them in measurement binaries. Final stop-state counters still print. */
+#ifndef SAPS_DPA_DIAGNOSTIC_PRINTS
+#define SAPS_DPA_DIAGNOSTIC_PRINTS 0
+#endif
 
 uint64_t dpa_plugin_rpc(uint64_t in_daddr);
 
@@ -161,8 +168,8 @@ uint64_t dpa_plugin_rpc(uint64_t in_daddr);
  * E1-integration: extended with degraded_since (safety-valve 2),
  * last_admit_tsc (safety-valve 1), degraded_reason (trace / debug). Adds 24 B
  * which pushes aligned sizeof from 256 to 320. L2 footprint at N=1024 is
- * 1024 × 320 = 320 KiB, still within the 1.5 MiB budget alongside the
- * 256 KiB g_submit_tsc_low and 512 KiB host ring.
+ * 1024 × 320 = 320 KiB. The submit table is 512 KiB; the host ring is
+ * accessed through the registered memory window rather than copied here.
  */
 struct conn_stats {
 	uint32_t window[DPA_PLUGIN_WINDOW_K];  /* log10_lat_ns * 1000, circular */
@@ -202,21 +209,24 @@ _Static_assert(sizeof(struct conn_stats) <= 320,
 /* All static — lives in DPA .bss, inside L2. */
 static struct conn_stats g_conn[DPA_PLUGIN_CONN_MAX];
 
-/* Submit-time direct-map table indexed by cmd_id (u16).
- * Stores low 32 bits of host_tsc. Sufficient to compute latency deltas up to
- * ~1 sec at typical ~2 GHz host TSC (2^32 / 2e9 ≈ 2.1 s). */
-static uint32_t g_submit_tsc_low[65536];
-
 /* Track submit timestamps by a compact (qp, path, cmd_id) key, not cmd_id
  * alone.  NVMe command IDs are scoped to a qpair; with multipath, different
  * paths can reuse the same cmd_id while one path has delayed completions.  A
  * cmd_id-only table lets fast peers overwrite the slow path's submit timestamp
- * and makes D2-style latency onset look healthy.  The eval QD is small, so 12
- * cmd_id bits plus 2 qp bits plus 2 path bits fit the original 64K table. */
-#define SAPS_SUBMIT_CID_BITS  12u
-#define SAPS_SUBMIT_QP_BITS   2u
+ * and makes D2-style latency onset look healthy.  Ten command-ID bits preserve
+ * every slot in the prototype's 1024-entry NVMe queue. Four tenant bits and
+ * three path bits distinguish the full 16-by-8 scheduler plane. */
+#define SAPS_SUBMIT_CID_BITS  10u
+#define SAPS_SUBMIT_QP_BITS   4u
+#define SAPS_SUBMIT_TABLE_LOG2 \
+	(SAPS_SUBMIT_CID_BITS + SAPS_SUBMIT_QP_BITS + DPA_PLUGIN_PATH_LOG2)
+#define SAPS_SUBMIT_TABLE_SIZE (1u << SAPS_SUBMIT_TABLE_LOG2)
 #define SAPS_SUBMIT_CID_MASK  ((1u << SAPS_SUBMIT_CID_BITS) - 1u)
 #define SAPS_SUBMIT_QP_MASK   ((1u << SAPS_SUBMIT_QP_BITS) - 1u)
+
+_Static_assert(SAPS_SUBMIT_TABLE_LOG2 == 17u,
+	       "submit timestamp table must cover 16 tenants, 8 paths, and 1024 CIDs");
+static uint32_t g_submit_tsc_low[SAPS_SUBMIT_TABLE_SIZE];
 
 static inline uint32_t
 saps_submit_slot(uint16_t cmd_id, uint16_t qp_idx, uint16_t path_idx)
@@ -410,6 +420,7 @@ struct dpa_path_state {
 	uint16_t _pad_state;
 	uint32_t probe_count;              /* RECOVERING ε-probe count */
 	uint64_t state_entered_tsc;
+	uint64_t healthy_since_tsc;        /* continuous HEALTHY verdict interval */
 
 	/* Last-event telemetry (debug aid; read by lease-renew trace). */
 	uint64_t last_complete_tsc;
@@ -775,6 +786,13 @@ static inline void saps_publish_counters(volatile struct dpa_plugin_shared *s)
  * D0 bootstrap skew (one path at 146µs, median at 40µs): cp_drift = 1.87 <
  * 2.322 → does NOT fire (path EWMA decays to normal within 64 clean IOs). */
 #define SAPS_CROSSPATH_DRIFT_HI_Q16    152170
+/* Consensus-relative latency health.  Below the 5x confidence boundary, keep
+ * full health so ordinary queueing variation cannot shrink admitted service.
+ * Beyond that boundary, h represents a service-capacity ratio. With fixed
+ * outstanding work, Little's law gives service rate proportional to inverse
+ * response time, so a log2 latency drift r maps to h = 2^-r. */
+#define SAPSQ_CONTINUOUS_HEALTH        1
+static inline uint32_t sapsq_continuous_health_from_drift(int64_t drift);
 #define SAPS_D7_REF_DRIFT_HI_Q16       65536  /* log2(2) */
 #define SAPS_D7_REF_MIN_SAMPLES        (SAPS_WARMUP_N + 64u)
 /* Slice 16 v3 — absolute-floor gate so cross-path drift only fires once
@@ -977,6 +995,8 @@ static inline void saps_publish_counters(volatile struct dpa_plugin_shared *s)
  * paths so shared-fate handling does not collapse sustained throughput to
  * two-thirds of stock once the detector stays active for the full run. */
 #define SAPS_SHARED_FATE_DEGRADED_N        2u
+#define SAPS_SHARED_FATE_LAT_MIN_SAMPLES    (SAPS_WARMUP_N + 65536u)
+#define SAPS_SHARED_FATE_TAIL_MAX_Q16      1600000
 #define SAPS_SHARED_FATE_HEAL_N            3u
 #define SAPS_T_SHARED_FATE_ROTATE_TICKS    (100ull * SAPS_TICKS_PER_MS)
 #define SAPS_T_SHARED_FATE_EXCLUDE_TICKS   (50ull * SAPS_TICKS_PER_MS)
@@ -984,8 +1004,8 @@ static inline void saps_publish_counters(volatile struct dpa_plugin_shared *s)
 
 /* B8 SHARED_FATE 服務能力 (service-capacity) 判據常數 (2026-06-11)。
  *
- * 一條路徑算 shared-fate degraded 只當「服務率掉 (capacity 低於
- * 自身 baseline) 或 err_rate 高」,不是只因延遲 (latency) 高。用 ratio 比較
+ * 一條路徑只在服務率低於自身 baseline 或 err_rate 高時被判為
+ * shared-fate degraded,不是只因延遲 (latency) 高。用 ratio 比較
  * 全整數,RATIO_DEN=1024 當定點分母。 */
 #define SAPS_SF_RATIO_DEN          1024u
 #define SAPS_SF_RATE_BAD_NUM       717u   /* current < 70% expected → 真劣化 */
@@ -1134,6 +1154,69 @@ static inline int64_t fixed_log2(uint64_t x)
 		frac_idx = (unsigned)((x << (8u - msb)) & 0xFFu);
 	int64_t frac_part = (int64_t)LOG2_FRAC_Q16_256[frac_idx];
 	return int_part + frac_part;
+}
+
+/*
+ * Convert a consensus-relative latency drift into the capacity fraction used
+ * by HCAA.  The detector's 5x boundary remains a confidence gate: ordinary
+ * queueing variation below it must not reduce the service envelope.  Once the
+ * gate is crossed, the factor follows the inverse latency ratio implied by
+ * Little's law for a fixed amount of outstanding work.
+ *
+ * LOG2_FRAC_Q16_256[k] approximates log2(1 + k/256).  Choosing the first table
+ * entry at or above the observed fractional drift gives a conservative
+ * estimate of 2^-drift without floating point.  This work runs once per
+ * controller epoch, not on the per-request path.
+ */
+static inline uint32_t sapsq_continuous_health_from_drift(int64_t drift)
+{
+	uint64_t whole;
+	uint16_t frac;
+	unsigned idx = 0;
+	uint32_t inv_frac_q16;
+	uint32_t health_q16;
+
+	if (drift <= (int64_t)SAPS_CROSSPATH_DRIFT_HI_Q16)
+		return SAPSQ_HEALTH_HEALTHY_Q16;
+
+	whole = (uint64_t)drift >> 16;
+	if (whole >= 16u)
+		return SAPSQ_HEALTH_PROBE_Q16;
+
+	frac = (uint16_t)((uint64_t)drift & 0xFFFFu);
+	while (idx < 255u && LOG2_FRAC_Q16_256[idx] < frac)
+		idx++;
+
+	inv_frac_q16 =
+		(uint32_t)(((uint64_t)SAPSQ_HEALTH_HEALTHY_Q16 * 256u) /
+			   (256u + idx));
+	health_q16 = inv_frac_q16 >> whole;
+	if (health_q16 < SAPSQ_HEALTH_PROBE_Q16)
+		health_q16 = SAPSQ_HEALTH_PROBE_Q16;
+
+	return health_q16;
+}
+
+/* Convert relative queue occupancy into a capacity factor for the queue-depth
+ * comparison arm. Both inputs are Q16.16 queue depth. The one-request offset
+ * keeps an idle path usable and avoids a singular ratio at zero occupancy.
+ * This helper is only selected by the controlled signal-isolation mode. */
+static inline uint32_t
+sapsq_queue_depth_health(uint64_t reference_q16, uint64_t observed_q16)
+{
+	uint64_t adjusted_reference = reference_q16 + (1u << 16);
+	uint64_t adjusted_observed = observed_q16 + (1u << 16);
+	uint64_t health_q16;
+
+	if (adjusted_observed <= adjusted_reference)
+		return SAPSQ_HEALTH_HEALTHY_Q16;
+
+	health_q16 = (adjusted_reference << 16) / adjusted_observed;
+	if (health_q16 < SAPSQ_HEALTH_PROBE_Q16)
+		health_q16 = SAPSQ_HEALTH_PROBE_Q16;
+	if (health_q16 > SAPSQ_HEALTH_HEALTHY_Q16)
+		health_q16 = SAPSQ_HEALTH_HEALTHY_Q16;
+	return (uint32_t)health_q16;
 }
 
 /* v2 SAPS helpers (spec-v4 §4.1 / §4.3 / §4.4 / §4.5 / §4.6). */
@@ -2151,6 +2234,22 @@ static inline bool saps_shared_fate_is_local_fault(uint16_t fault_type)
 	       fault_type != SAPS_FAULT_ALL_DEGRADED;
 }
 
+/* The host D5 gate compares published opcode P99 values across paths.  Below
+ * the classifier's 1 ms absolute evidence floor, estimator jitter must not
+ * manufacture a 2x "slow" path and drain an otherwise HEALTHY route.  Publish
+ * one neutral floor value for those healthy samples; real fail-slow evidence
+ * remains above the floor and therefore stays distinguishable. */
+static inline uint32_t
+saps_opcode_p99_for_host(const struct dpa_path_state *p, unsigned opc)
+{
+	int64_t value = p->opc_p99[opc].p99;
+
+	if (p->fault_type == SAPS_FAULT_HEALTHY &&
+	    value > 0 && value < SAPS_LAT_HEALTHY_FLOOR_Q16)
+		value = SAPS_LAT_HEALTHY_FLOOR_Q16;
+	return (uint32_t)(value & 0xFFFFFFFF);
+}
+
 static inline uint32_t saps_capacity_refresh_score(struct dpa_path_state *p)
 {
 	uint64_t rate_q16 = p->capacity_rate_ewma_q16;
@@ -2381,6 +2480,10 @@ static inline bool saps_sf_path_degraded_this_tick(const struct dpa_path_state *
 	if (pressure && rate_ok && !nlat_bad)
 		return false;
 
+	/* Guard v2: nlat_bad alone is not degraded while rate and score are healthy. */
+	if (rate_ok && !rate_bad && !score_bad)
+		return false;
+
 	/* 真服務劣化:服務率掉、或 raw score 掉、或 QD-正規化延遲升。 */
 	return rate_bad || score_bad || nlat_bad;
 }
@@ -2406,8 +2509,10 @@ static inline bool saps_shared_fate_path_has_degraded_evidence(const struct dpa_
 	if (p->n < SAPS_WARMUP_N || p->baseline_log_lat_q16 == 0)
 		return false;
 
-	if (is_current && saps_shared_fate_is_local_fault(current_fault))
-		return true;
+	/* Do not count the current IO fault as SHARED_FATE evidence; only
+	 * cached path state/capacity evidence can establish cross-path fate. */
+	(void)is_current;
+	(void)current_fault;
 
 	if (saps_shared_fate_is_local_fault(p->fault_type))
 		return true;
@@ -2429,29 +2534,31 @@ static inline bool saps_shared_fate_path_has_degraded_evidence(const struct dpa_
 			return true;
 	}
 
-	/* B8 false-positive fix v2 (2026-06-11):服務能力 (service-capacity) 判據。
-	 *
-	 * 前一次「baseline 變化點 (change-point) gate」實測無效:單一路徑 D1 下,
-	 * 健康路徑被 re-steer 加壓 (queueing pressure) 時,其凍結 baseline 維持低點
-	 * 而排隊延遲飆高 → mean − baseline 的 delta 同樣很大 → 與真故障用延遲無法
-	 * 區分 → A/C 仍被誤算 degraded → degraded≥2 → 誤觸發 SHARED_FATE → 收回壞
-	 * 路徑 B → d1_sapsqon 崩 82K。
-	 *
-	 * 改用服務能力,不看原始延遲:純排隊壓力下健康路徑「服務率正常、QD-正規化
-	 * 延遲 (QD-normalized latency) 不動」,只有真服務變慢才升。判據:
-	 *   - 服務率掉 (rate_fast 低於自身 baseline 期望率) 或 raw capacity_score 掉
-	 *     或 QD-正規化延遲升 或 err_rate 高 → degraded。
-	 *   - 排隊壓力 (QD 高且遠超 baseline QD) + 服務率正常 + QD-正規化延遲未升
-	 *     → 明確「塞車,不算」。
-	 *   - QD<2 不判 (除非 err 高)。
-	 *   - persistence:此 tick verdict 由 saps_capacity_fast_tick 後的呼叫端寫入
-	 *     sf_degraded_history 環,2-of-3 才算 → 濾暫態。此處只讀 cached boolean,
-	 *     滿足 DPA <500ns 熱路徑(重 telemetry 算已在 fast tick 完成)。
-	 *
-	 * D7 真雙路徑共命運:兩條路徑服務真的都慢 → 完成率真的掉、QD-正規化延遲真的
-	 * 升 → rate_bad / nlat_bad 為真 → 兩條都過此判據 → degraded≥2 → SHARED_FATE
-	 * 仍正常觸發。(純排隊下完成率不掉、QD-正規化延遲不動,才是被抑制的 case。) */
+	/* B8 shared-fate service-capacity verdict: only persisted capacity
+	 * degradation counts as cross-path degraded evidence. */
 	return p->sf_degraded_cached != 0;
+}
+
+static inline bool
+saps_shared_fate_path_has_latency_tail_evidence(const struct dpa_path_state *p)
+{
+	if (p->n < SAPS_SHARED_FATE_LAT_MIN_SAMPLES ||
+	    p->baseline_log_lat_q16 == 0 ||
+	    p->recent_sample_count < 4)
+		return false;
+
+	bool p99_tail =
+		p->p99_estimate > SAPS_TAIL_LOG_LAT_Q16 &&
+		p->p99_estimate < SAPS_SHARED_FATE_TAIL_MAX_Q16;
+	bool recent_tail =
+		p->bimodal_consec_windows >= 2u &&
+		p->max_log_lat_recent < SAPS_SHARED_FATE_TAIL_MAX_Q16 &&
+		p->max_log_lat_recent > SAPS_TAIL_LOG_LAT_Q16 &&
+		p->tail_count_recent >= SAPS_TAIL_COUNT_MIN;
+
+	return (p99_tail || recent_tail) &&
+	       p->err_rate_ewma < SAPS_ERR_RATE_LOW_Q16 &&
+	       p->recent_err_count < SAPS_RECENT_ERR_THRESH;
 }
 
 static inline bool saps_shared_fate_active(uint16_t qp_idx,
@@ -2461,21 +2568,79 @@ static inline bool saps_shared_fate_active(uint16_t qp_idx,
 					   uint64_t now_tsc)
 {
 	unsigned degraded = 0;
+	unsigned excluded_count = 0;
 
 	for (unsigned i = 0; i < DPA_PLUGIN_PATH_MAX; i++) {
-		if (saps_shared_fate_path_has_degraded_evidence(&g_path[qp_idx][i],
-								i == current_path_idx,
-								current_fault))
-			degraded++;
+		if (g_path[qp_idx][i].n >= SAPS_WARMUP_N &&
+		    g_path[qp_idx][i].state == DPA_SAPS_STATE_EXCLUDED)
+			excluded_count++;
 	}
 
-	if (all_paths_degraded || degraded >= SAPS_SHARED_FATE_DEGRADED_N) {
-		g_shared_fate_until_tsc[qp_idx] = now_tsc + SAPS_T_SHARED_FATE_LEASE_TICKS;
+	if (excluded_count == 0) {
+		for (unsigned i = 0; i < DPA_PLUGIN_PATH_MAX; i++) {
+			if (saps_shared_fate_path_has_degraded_evidence(
+				    &g_path[qp_idx][i],
+				    i == current_path_idx,
+				    current_fault) ||
+			    saps_shared_fate_path_has_latency_tail_evidence(
+				    &g_path[qp_idx][i]))
+				degraded++;
+		}
+	}
+
+	if (excluded_count == 0 &&
+	    (all_paths_degraded || degraded >= SAPS_SHARED_FATE_DEGRADED_N)) {
+		g_shared_fate_until_tsc[qp_idx] =
+			now_tsc + SAPS_T_SHARED_FATE_LEASE_TICKS;
 		return true;
+	}
+
+	if (excluded_count > 0) {
+		g_shared_fate_until_tsc[qp_idx] = 0;
+		return false;
 	}
 
 	return g_shared_fate_until_tsc[qp_idx] != 0 &&
 	       now_tsc < g_shared_fate_until_tsc[qp_idx];
+}
+
+static inline bool
+saps_shared_fate_path_latency_degraded(const struct dpa_path_state *p,
+				       int64_t current_consensus_log_lat_q16,
+				       int64_t baseline_consensus_log_lat_q16,
+				       bool baseline_fallback_allowed)
+{
+	if (p->n < SAPS_WARMUP_N ||
+	    p->baseline_log_lat_q16 == 0 ||
+	    current_consensus_log_lat_q16 <= 0)
+		return false;
+
+	/* SHARED_FATE exclusion must be backed by sustained latency degradation.
+	 * Healthy paths can carry high QD while absorbing traffic from a drained peer. */
+	if (saps_shared_fate_path_has_latency_tail_evidence(p) &&
+	    p->p99_estimate > SAPS_TAIL_LOG_LAT_Q16 &&
+	    p->p99_estimate < SAPS_SHARED_FATE_TAIL_MAX_Q16 &&
+	    p->mean_log_lat_ewma_q16 - current_consensus_log_lat_q16 >=
+		    (int64_t)SAPS_SF_LAT_BAD_DELTA_Q16 &&
+	    p->p99_estimate - current_consensus_log_lat_q16 >=
+		    (int64_t)SAPS_CROSSPATH_DRIFT_HI_Q16)
+		return true;
+
+	if (p->mean_log_lat_ewma_q16 <= SAPS_LAT_HEALTHY_FLOOR_Q16)
+		return false;
+
+	if (baseline_fallback_allowed &&
+	    baseline_consensus_log_lat_q16 > 0 &&
+	    p->mean_log_lat_ewma_q16 - baseline_consensus_log_lat_q16 >=
+		    (int64_t)SAPS_SF_LAT_BAD_DELTA_Q16 &&
+	    saps_shared_fate_path_has_latency_tail_evidence(p))
+		return true;
+
+	if (p->mean_log_lat_ewma_q16 - current_consensus_log_lat_q16 >=
+	    (int64_t)SAPS_CROSSPATH_DRIFT_HI_Q16)
+		return true;
+
+	return false;
 }
 
 static inline void saps_shared_fate_publish_path(volatile struct dpa_plugin_shared *s,
@@ -2501,7 +2666,7 @@ static inline void saps_shared_fate_publish_path(volatile struct dpa_plugin_shar
 			s->per_qp_path_score_opcode[qp_idx][path_idx][opc] = s_opc;
 		if (p->opc_p99[opc].n > SAPS_WARMUP_N && p->opc_p99[opc].p99 > 0)
 			s->per_qp_path_opc_p99[qp_idx][path_idx][opc] =
-				(uint32_t)(p->opc_p99[opc].p99 & 0xFFFFFFFF);
+				saps_opcode_p99_for_host(p, opc);
 	}
 
 	s->per_qp_path_state[qp_idx][path_idx] = p->state;
@@ -2527,30 +2692,84 @@ static inline void saps_shared_fate_apply(volatile struct dpa_plugin_shared *s,
 					  uint64_t now_tsc)
 {
 	uint16_t warmed[DPA_PLUGIN_PATH_MAX];
+	uint16_t exclude_candidates[DPA_PLUGIN_PATH_MAX];
 	unsigned warmed_n = 0;
+	unsigned exclude_n = 0;
+	unsigned latency_tail_n = 0;
+	int64_t current_consensus_log_lat_q16 = 0;
+	int64_t current_max_log_lat_q16 = 0;
+	int64_t baseline_consensus_log_lat_q16 = 0;
 
 	for (unsigned i = 0; i < DPA_PLUGIN_PATH_MAX; i++) {
 		struct dpa_path_state *q = &g_path[qp_idx][i];
+		int64_t cur = q->mean_log_lat_ewma_q16;
 
-		if (q->n >= SAPS_WARMUP_N && q->baseline_log_lat_q16 != 0)
-			warmed[warmed_n++] = (uint16_t)i;
+		if (q->n != 0 && q->recent_sample_count >= 4 && cur > 0 &&
+		    (current_consensus_log_lat_q16 == 0 ||
+		     cur < current_consensus_log_lat_q16))
+			current_consensus_log_lat_q16 = cur;
 	}
-	if (warmed_n < 2)
+
+	for (unsigned i = 0; i < DPA_PLUGIN_PATH_MAX; i++) {
+		struct dpa_path_state *q = &g_path[qp_idx][i];
+		int64_t cur = q->mean_log_lat_ewma_q16;
+
+		if (q->n >= SAPS_WARMUP_N && q->baseline_log_lat_q16 != 0) {
+			warmed[warmed_n++] = (uint16_t)i;
+			if (cur > 0 &&
+			    (current_consensus_log_lat_q16 == 0 ||
+			     cur < current_consensus_log_lat_q16))
+				current_consensus_log_lat_q16 = cur;
+			if (cur > current_max_log_lat_q16)
+				current_max_log_lat_q16 = cur;
+			if (saps_shared_fate_path_has_latency_tail_evidence(q))
+				latency_tail_n++;
+			if (baseline_consensus_log_lat_q16 == 0 ||
+			    q->baseline_log_lat_q16 < baseline_consensus_log_lat_q16)
+				baseline_consensus_log_lat_q16 = q->baseline_log_lat_q16;
+		}
+	}
+	if (warmed_n < 2 || current_consensus_log_lat_q16 <= 0)
 		return;
+
+	bool baseline_fallback_allowed =
+		latency_tail_n >= SAPS_SHARED_FATE_DEGRADED_N &&
+		current_max_log_lat_q16 - current_consensus_log_lat_q16 <
+			(int64_t)SAPS_CROSSPATH_DRIFT_HI_Q16;
+
+	for (unsigned wi = 0; wi < warmed_n; wi++) {
+		uint16_t i = warmed[wi];
+
+		if (saps_shared_fate_path_latency_degraded(
+			    &g_path[qp_idx][i],
+			    current_consensus_log_lat_q16,
+			    baseline_consensus_log_lat_q16,
+			    baseline_fallback_allowed))
+			exclude_candidates[exclude_n++] = i;
+	}
+
+	if (exclude_n < SAPS_SHARED_FATE_DEGRADED_N) {
+		g_shared_fate_last_excluded_plus1[qp_idx] = 0;
+		return;
+	}
 
 	uint64_t rotate_ticks = SAPS_T_SHARED_FATE_ROTATE_TICKS;
 	uint64_t phase = rotate_ticks != 0 ? now_tsc % rotate_ticks : 0;
 	bool in_exclude_window = phase < SAPS_T_SHARED_FATE_EXCLUDE_TICKS;
-	unsigned slot = (unsigned)((rotate_ticks != 0 ? now_tsc / rotate_ticks : 0) % warmed_n);
-	uint16_t excluded = in_exclude_window ? warmed[slot] : (uint16_t)DPA_PLUGIN_PATH_MAX;
+	unsigned slot = exclude_n != 0 ?
+		(unsigned)((rotate_ticks != 0 ? now_tsc / rotate_ticks : 0) % exclude_n) : 0;
+	uint16_t excluded = (in_exclude_window && exclude_n != 0) ?
+		exclude_candidates[slot] : (uint16_t)DPA_PLUGIN_PATH_MAX;
+	if (exclude_n == 0)
+		in_exclude_window = false;
 
-	for (unsigned tries = 0; in_exclude_window && tries < warmed_n; tries++) {
+	for (unsigned tries = 0; in_exclude_window && tries < exclude_n; tries++) {
 		struct dpa_path_state *q = &g_path[qp_idx][excluded];
 
 		if (q->shared_fate_fast_consec < SAPS_SHARED_FATE_HEAL_N)
 			break;
-		slot = (slot + 1) % warmed_n;
-		excluded = warmed[slot];
+		slot = (slot + 1) % exclude_n;
+		excluded = exclude_candidates[slot];
 	}
 
 	if (!in_exclude_window) {
@@ -2566,8 +2785,22 @@ static inline void saps_shared_fate_apply(volatile struct dpa_plugin_shared *s,
 	for (unsigned wi = 0; wi < warmed_n; wi++) {
 		uint16_t i = warmed[wi];
 		struct dpa_path_state *q = &g_path[qp_idx][i];
+		bool is_candidate = false;
 
-		q->fault_type = SAPS_FAULT_SHARED_FATE;
+		for (unsigned ci = 0; ci < exclude_n; ci++) {
+			if (exclude_candidates[ci] == i) {
+				is_candidate = true;
+				break;
+			}
+		}
+
+		/* Per-path evidence owns quarantine.  SHARED_FATE is only an
+		 * annotation and must not overwrite or heal a locally diagnosed path. */
+		if (saps_shared_fate_is_local_fault(q->fault_type)) {
+			saps_shared_fate_publish_path(s, qp_idx, i, opcode);
+			continue;
+		}
+
 		if (i == current_path_idx) {
 			if (clean_success && log_lat > 0 &&
 			    log_lat <= SAPS_B8_FAST_LOG_LAT_Q16) {
@@ -2577,30 +2810,15 @@ static inline void saps_shared_fate_apply(volatile struct dpa_plugin_shared *s,
 				q->shared_fate_fast_consec = 0;
 			}
 		}
-		if (i == excluded) {
-			if (q->state != DPA_SAPS_STATE_EXCLUDED) {
-				q->state = DPA_SAPS_STATE_EXCLUDED;
-				q->state_entered_tsc = now_tsc;
-				q->probe_count = 0;
-				q->max_log_lat_recent = 0;
-				q->max_lat_window_n = 0;
-				q->tail_count_recent = 0;
-				q->bimodal_consec_windows = 0;
-			}
-		} else {
-			if (q->shared_fate_fast_consec >= SAPS_SHARED_FATE_HEAL_N)
-				q->state = DPA_SAPS_STATE_HEALTHY;
-			else if (!in_exclude_window)
-				q->state = DPA_SAPS_STATE_HEALTHY;
-			else if (q->state == DPA_SAPS_STATE_EXCLUDED ||
-				 q->state == DPA_SAPS_STATE_RECOVERING)
-				q->state = DPA_SAPS_STATE_DEGRADING;
-			q->state_entered_tsc = now_tsc;
-		}
-
+		/* The lease/candidate record is annotation only.  Do not write the
+		 * action fault_type or FSM state here; the per-path classifier owns
+		 * both, including quarantine and recovery. */
+		(void)is_candidate;
 		saps_shared_fate_publish_path(s, qp_idx, i, opcode);
 	}
 }
+
+
 
 /* ── Slice 10 multi-modal classifier (spec §3.2) ───────────────────────────
  *
@@ -2669,6 +2887,7 @@ static inline bool saps_b8_force_recovery(struct dpa_path_state *p,
 	p->probe_count = 0;
 	p->consec_nonhealthy_count = 0;
 	p->active_heal_fast_consec = 0;
+	p->healthy_since_tsc = 0;
 	ring_push(p->fsm_trans_tsc_ms_ring, &p->fsm_trans_ring_head, 4, now_ms);
 
 	flexio_dev_print("[B8_HEAL] qp=%u path=%u old_state=%u new_state=%u old_ft=%u fast_log=%ld\n",
@@ -2774,6 +2993,13 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 	if (__builtin_expect(p->n < SAPS_WARMUP_N || p->baseline_log_lat_q16 == 0, 0))
 		return SAPS_FAULT_HEALTHY;
 
+	/* A protocol error is direct completion evidence and takes precedence
+	 * over queue- or capacity-derived diagnoses that may already be latched
+	 * on the path.  Otherwise a prior PROPORTIONAL_THROTTLE verdict can mask
+	 * an NVMe media/path status indefinitely and keep HCAA at h_p=1. */
+	if (p->recent_err_count >= SAPS_RECENT_ERR_THRESH)
+		return SAPS_FAULT_SPARSE_ERROR;
+
 	/* Round 2 D8 service-rate detector.  A target-throttle path can look
 	 * latency-slow only because host-side queues build behind service-rate
 	 * loss.  When QD evidence is already present and mean latency is below
@@ -2796,6 +3022,10 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 	 * 5ms max plus log-ratio > 3) is already strong bimodal signal — D0 ARM
 	 * jitter cannot produce 25 samples > 4ms within 512 samples even once. */
 	int64_t fix6_excess = p->max_log_lat_recent - p->mean_log_lat_ewma_q16;
+	bool path_above_current_consensus =
+		global_min_valid &&
+		p->mean_log_lat_ewma_q16 - global_min_log_lat_q16 >
+			SAPS_CROSSPATH_DRIFT_HI_Q16;
 	/* Fix 8 (2026-05-18): drop bimodal_consec_windows requirement entirely.
 	 * Reason: B oscillates H↔E so traffic on B never sustains a single 512-sample
 	 * window to completion → bimodal_consec stuck at 0. With max>4ms floor +
@@ -2803,11 +3033,15 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 	 * false-fire (max < 1ms < 4ms floor); D4 B can fire BIMODAL_TAIL on partial
 	 * window evidence and stay quarantined via FSM. */
 	bool p_looks_bimodal =
+		path_above_current_consensus &&
+		p->mean_log_lat_ewma_q16 > SAPS_TAIL_LOG_LAT_Q16 &&
+		p->sf_degraded_cached != 0 &&
 		p->max_log_lat_recent > SAPS_TAIL_LOG_LAT_Q16 &&
 		p->tail_count_recent >= SAPS_TAIL_COUNT_MIN &&
 		fix6_excess > SAPS_MAX_RATIO_HI_Q16 &&
 		p->err_rate_ewma < SAPS_ERR_RATE_LOW_Q16 &&
 		p->recent_err_count < SAPS_RECENT_ERR_THRESH;
+
 
 	bool qd_drift_candidate =
 		global_median_qd_valid &&
@@ -2834,6 +3068,18 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 		!peer_latency_fault_active &&
 		!all_paths_degraded &&
 		!p_looks_bimodal;  /* Fix 6: defer to BIMODAL latch */
+	/* A previously latched service-rate verdict must not mask stronger
+	 * latency evidence.  This is the same evidence used by the existing
+	 * severe-latency rule below.  Letting it preempt the proportional hold
+	 * makes classification monotonic as a path moves from reduced service
+	 * into a sustained latency failure. */
+	bool severe_latency_candidate =
+		p->n >= SAPS_LAT_ABS_MIN_SAMPLES &&
+		p->mean_log_lat_ewma_q16 > SAPS_TAIL_LOG_LAT_Q16 &&
+		!peer_latency_fault_active &&
+		saps_qd_backed_slow(p) &&
+		p->tail_count_recent >= SAPS_TAIL_COUNT_MIN &&
+		p->err_rate_ewma < SAPS_ERR_RATE_LOW_Q16;
 
 	/* Fix 6: if bimodal pattern is active, jump straight to Slice 15 latch.
 	 * Returns immediately with SAPS_FAULT_BIMODAL_TAIL — bypasses qd_drift /
@@ -2857,12 +3103,14 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 		return SAPS_FAULT_PROPORTIONAL_THROTTLE;
 	}
 
-	if (p->fault_type == SAPS_FAULT_PROPORTIONAL_THROTTLE &&
+	if (!severe_latency_candidate &&
+	    p->fault_type == SAPS_FAULT_PROPORTIONAL_THROTTLE &&
 	    capacity_low_candidate) {
 		p->proportional_hold_consec = SAPS_PROPORTIONAL_HOLD_N;
 		return SAPS_FAULT_PROPORTIONAL_THROTTLE;
 	}
-	if (p->fault_type == SAPS_FAULT_PROPORTIONAL_THROTTLE &&
+	if (!severe_latency_candidate &&
+	    p->fault_type == SAPS_FAULT_PROPORTIONAL_THROTTLE &&
 	    global_capacity_valid &&
 	    p->capacity_score != 0 &&
 	    (uint64_t)p->capacity_score * SAPS_CAPACITY_CLEAR_DEN <
@@ -2871,13 +3119,14 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 			p->proportional_hold_consec--;
 		if (p->proportional_hold_consec != 0)
 			return SAPS_FAULT_PROPORTIONAL_THROTTLE;
-	} else if (p->fault_type == SAPS_FAULT_PROPORTIONAL_THROTTLE) {
+	} else if (!severe_latency_candidate &&
+		   p->fault_type == SAPS_FAULT_PROPORTIONAL_THROTTLE) {
 		p->proportional_hold_consec = SAPS_PROPORTIONAL_HOLD_N;
 		return SAPS_FAULT_PROPORTIONAL_THROTTLE;
 	}
 
-		if (all_paths_degraded)
-			return SAPS_FAULT_SHARED_FATE;
+		/* all_paths_degraded feeds the separate SHARED_FATE annotation
+		 * lease below.  It must not replace this path's evidence verdict. */
 
 			/* Round 6 D2 B6c: ANY_THREE_VOTE.  Per experiment contract, publish
 		 * ONSET-family behavior when any one of B2 CUSUM, B3 cross-path MAD,
@@ -2900,6 +3149,9 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 			p->max_log_lat_recent > SAPS_TAIL_LOG_LAT_Q16 &&
 			b7_max_excess > SAPS_MAX_RATIO_HI_Q16;
 		bool probe_slow =
+			path_above_current_consensus &&
+			p->mean_log_lat_ewma_q16 > SAPS_TAIL_LOG_LAT_Q16 &&
+			p->sf_degraded_cached != 0 &&
 			p->n >= SAPS_B7_MIN_SAMPLES &&
 			p->bocpd_last_log_lat_q16 > SAPS_TAIL_LOG_LAT_Q16 &&
 			p->tail_count_recent >= SAPS_B7_TAIL_COUNT_MIN &&
@@ -3316,12 +3568,14 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 		int64_t onset_cp_delta = global_median_valid
 			? p->mean_log_lat_ewma_q16 - global_median_log_lat_q16
 			: 0;
-			bool onset_can_fire =
-				p->n >= SAPS_ONSET_MIN_SAMPLES &&
-				!qd_service_candidate &&
-				p->mean_log_lat_ewma_q16 > SAPS_TAIL_LOG_LAT_Q16 &&
-				global_median_valid &&
-				onset_cp_delta > SAPS_ONSET_DELTA_FIRE_Q16;
+		bool onset_can_fire =
+			path_above_current_consensus &&
+			p->sf_degraded_cached != 0 &&
+			p->n >= SAPS_ONSET_MIN_SAMPLES &&
+			!qd_service_candidate &&
+			p->mean_log_lat_ewma_q16 > SAPS_TAIL_LOG_LAT_Q16 &&
+			global_median_valid &&
+			onset_cp_delta > SAPS_ONSET_DELTA_FIRE_Q16;
 
 		if (onset_can_fire &&
 		    onset_delta > SAPS_ONSET_DELTA_FIRE_Q16) {
@@ -3455,7 +3709,8 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 	 * positive. Without this floor, a 300µs scheduler jitter on a 27µs
 	 * mean D0 path gives max/mean=11x > log2(8)=8x threshold → false
 	 * BIMODAL_TAIL → cooldown latch → IOPS drag. */
-	if (p->max_log_lat_recent > SAPS_TAIL_LOG_LAT_Q16 &&
+	if (p->mean_log_lat_ewma_q16 > SAPS_TAIL_LOG_LAT_Q16 &&
+	    p->max_log_lat_recent > SAPS_TAIL_LOG_LAT_Q16 &&
 	    p->tail_count_recent >= SAPS_TAIL_COUNT_MIN &&
 	    p->bimodal_consec_windows >= 2u) {
 		int64_t pre_excess = p->max_log_lat_recent - p->mean_log_lat_ewma_q16;
@@ -3489,7 +3744,9 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 		p->tail_count_recent >= SAPS_TAIL_COUNT_MIN &&
 		p->err_rate_ewma < SAPS_ERR_RATE_LOW_Q16 &&
 		p->recent_err_count < SAPS_RECENT_ERR_THRESH;
-	if ((newma_rate > SAPS_FLAP_NEWMA_FIRE_HI ||
+	if (path_above_current_consensus &&
+	    p->sf_degraded_cached != 0 &&
+	    (newma_rate > SAPS_FLAP_NEWMA_FIRE_HI ||
 	     fsm_rate   > SAPS_FLAP_FSM_TRANS_HI) &&
 	    !fix10_looks_bimodal_for_flap_guard)
 		return SAPS_FAULT_FLAP;
@@ -3556,28 +3813,6 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 	    p->err_rate_ewma < SAPS_ERR_RATE_LOW_Q16)
 		return SAPS_FAULT_PERPETUAL_SLOW;
 
-	/* Rule 3: SPARSE_ERROR — recent errors present, mean not yet at
-	 * PERPETUAL_SLOW level (< 2× baseline).  Upper bound is relaxed from
-	 * LAT_RATIO_OK_HI (log2 1.25) to LAT_RATIO_HI (log2 2.0 - 1 LSB) so
-	 * that sparse-error retry overhead that nudges mean_log_lat slightly
-	 * above 1.25× baseline is still caught here rather than falling through
-	 * to the BIMODAL_TAIL rule below.  Semantically correct: any path that
-	 * is producing recent NVMe errors (sct≠0) should be handled by the
-	 * error-aware SPARSE_ERROR action, not the bimodal tail action. */
-	/* Slice 34 fix 2 (D3 sct=3 root cause): drop the lat_diff > SAPS_LAT_RATIO_OK_LO_Q16
-	 * lower bound. Original bound assumed errors elevate path latency, so SPARSE_ERROR
-	 * fires only when mean is at-or-above baseline. NVMe sct=3 PATH ERROR has the
-	 * opposite property: target fast-fails with delta_ticks≈0 → mean pulled BELOW
-	 * baseline → lat_diff large negative → bound rejects every sct=3 sample → fault
-	 * never classified. Fix 1 above (sct=0 filter at retry_count gate) keeps mean
-	 * clean for future samples, but residual stale state may still fail this bound;
-	 * recent_err_count >= SAPS_RECENT_ERR_THRESH alone is sufficient evidence the
-	 * path produced NVMe errors. Upper bound retained so PERPETUAL_SLOW band claim
-	 * is preserved. */
-	if (p->recent_err_count >= SAPS_RECENT_ERR_THRESH &&
-	    lat_diff < SAPS_LAT_RATIO_HI_Q16)
-		return SAPS_FAULT_SPARSE_ERROR;
-
 	/* Rule 4: BIMODAL_TAIL — P99 far above mean with low error rate AND
 	 * no recent NVMe errors.  The "no recent errors" guard (recent_err_count
 	 * == 0) prevents D3-style sparse-error paths from being misclassified:
@@ -3602,7 +3837,8 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 	 *       in the 64-sample exact ring makes max2 > 1ms, clears the floor,
 	 *       p99_excess > 5×, and BIMODAL_TAIL fires on a healthy D0 path. */
 	int64_t p99_excess = p->p99_estimate - p->mean_log_lat_ewma_q16;
-	if (p->p99_estimate > SAPS_TAIL_LOG_LAT_Q16 &&
+	if (p->mean_log_lat_ewma_q16 > SAPS_TAIL_LOG_LAT_Q16 &&
+	    p->p99_estimate > SAPS_TAIL_LOG_LAT_Q16 &&
 	    p99_excess > SAPS_P99_RATIO_HI_Q16 &&
 	    p->tail_count_recent >= SAPS_TAIL_COUNT_MIN &&
 	    p->bimodal_consec_windows >= 2u &&
@@ -3622,7 +3858,8 @@ static inline uint16_t classify_fault_type_raw(struct dpa_path_state *p,
 	 * above — prevents D0 scheduler-jitter max samples from false-firing
 	 * BIMODAL_TAIL here too. D4 5ms spikes remain above the floor. */
 	int64_t max_excess = p->max_log_lat_recent - p->mean_log_lat_ewma_q16;
-	if (p->max_log_lat_recent > SAPS_TAIL_LOG_LAT_Q16 &&
+	if (p->mean_log_lat_ewma_q16 > SAPS_TAIL_LOG_LAT_Q16 &&
+	    p->max_log_lat_recent > SAPS_TAIL_LOG_LAT_Q16 &&
 	    max_excess > SAPS_MAX_RATIO_HI_Q16 &&
 	    p->tail_count_recent >= SAPS_TAIL_COUNT_MIN &&
 	    p->bimodal_consec_windows >= 2u &&
@@ -3846,25 +4083,36 @@ static inline void update_state_machine(struct dpa_path_state *p,
 		 * continuously → N=4 hysteresis saturates in ~4 IOs → DEGRADING. */
 		if (p->fault_type != SAPS_FAULT_HEALTHY &&
 		    p->fault_type != SAPS_FAULT_QD_DRIFT &&
-		    p->fault_type != SAPS_FAULT_PROPORTIONAL_THROTTLE) {
+		    p->fault_type != SAPS_FAULT_PROPORTIONAL_THROTTLE &&
+		    p->fault_type != SAPS_FAULT_SHARED_FATE) {
 			new_state = DPA_SAPS_STATE_DEGRADING;
 		}
 		break;
 	case DPA_SAPS_STATE_DEGRADING:
 		/* Escalate if fault continues past T_DEG_TICKS; recover if fault
-		 * clears within T_RECOVER_TICKS. Both conditions now use fault_type
-		 * rather than raw NEWMA so isolated jitter spikes in DEGRADING do not
-		 * reset the timer toward EXCLUDED (a spike that wouldn't have entered
-		 * DEGRADING without the fault_type gate won't sustain it either). */
-		if (p->fault_type != SAPS_FAULT_HEALTHY &&
-		    since > SAPS_T_DEG_TICKS &&
-		    !saps_fault_is_onset_family(p->fault_type) &&
-		    p->fault_type != SAPS_FAULT_QD_DRIFT &&
-		    p->fault_type != SAPS_FAULT_PROPORTIONAL_THROTTLE) {
-			new_state = DPA_SAPS_STATE_EXCLUDED;
-		} else if (p->fault_type == SAPS_FAULT_HEALTHY &&
-			   since > SAPS_T_RECOVER_TICKS) {
-			new_state = DPA_SAPS_STATE_HEALTHY;
+		 * remains clear for T_RECOVER_TICKS. State age cannot stand in for
+		 * a healthy interval: after a long degradation, one stale HEALTHY
+		 * verdict would otherwise re-admit a path immediately. */
+		if (p->fault_type == SAPS_FAULT_HEALTHY) {
+			if (p->healthy_since_tsc == 0) {
+				p->healthy_since_tsc = now_tsc;
+			} else {
+				uint64_t healthy_for =
+					now_tsc >= p->healthy_since_tsc
+					? now_tsc - p->healthy_since_tsc
+					: 0;
+				if (healthy_for > SAPS_T_RECOVER_TICKS)
+					new_state = DPA_SAPS_STATE_HEALTHY;
+			}
+		} else {
+			p->healthy_since_tsc = 0;
+			if (since > SAPS_T_DEG_TICKS &&
+			    !saps_fault_is_onset_family(p->fault_type) &&
+			    p->fault_type != SAPS_FAULT_QD_DRIFT &&
+			    p->fault_type != SAPS_FAULT_PROPORTIONAL_THROTTLE &&
+			    p->fault_type != SAPS_FAULT_SHARED_FATE) {
+				new_state = DPA_SAPS_STATE_EXCLUDED;
+			}
 		}
 		break;
 	case DPA_SAPS_STATE_EXCLUDED:
@@ -3934,7 +4182,8 @@ static inline void update_state_machine(struct dpa_path_state *p,
 	case DPA_SAPS_STATE_RECOVERING:
 		if (p->fault_type != SAPS_FAULT_HEALTHY &&
 		    p->fault_type != SAPS_FAULT_QD_DRIFT &&
-		    p->fault_type != SAPS_FAULT_PROPORTIONAL_THROTTLE) {
+		    p->fault_type != SAPS_FAULT_PROPORTIONAL_THROTTLE &&
+		    p->fault_type != SAPS_FAULT_SHARED_FATE) {
 			new_state = DPA_SAPS_STATE_EXCLUDED;
 		} else {
 			/* Count consecutive healthy probes. On warmup-N, promote. */
@@ -3953,6 +4202,7 @@ static inline void update_state_machine(struct dpa_path_state *p,
 		uint16_t old_state = p->state;
 		p->state = new_state;
 		p->state_entered_tsc = now_tsc;
+		p->healthy_since_tsc = 0;
 		/* Slice 10: record transition into ring so classify_fault_type
 		 * can detect FLAP (repeated transitions within 1 s window). */
 		uint32_t now_ms = (uint32_t)(now_tsc / SAPS_TICKS_PER_MS);
@@ -4321,11 +4571,22 @@ static inline void saps_update(volatile struct dpa_plugin_shared *s,
 	 * fault_type is consumed by both update_state_machine() (FLAP freeze)
 	 * and compute_score() (PERPETUAL_SLOW clamp / BIMODAL_TAIL shift). */
 	uint32_t now_ms = (uint32_t)(host_tsc / SAPS_TICKS_PER_MS);
-	/* Slice 16 — compute global median log-lat across paths in this qp.
+	/* Slice 16 -- compute global median log-lat across paths in this qp.
 	 * Median of N=3 paths is the middle value; we sort by simple compare.
 	 * Only paths with completed warmup and a frozen baseline contribute.
 	 * If fewer than 2 contribute, median is invalid and the cross-path
 	 * rule is skipped (handled by global_median_valid flag). */
+	int64_t sf_current_consensus_log_lat_q16 = 0;
+	for (unsigned i = 0; i < DPA_PLUGIN_PATH_MAX; i++) {
+		struct dpa_path_state *q = &g_path[qp_idx][i];
+		int64_t cur = q->mean_log_lat_ewma_q16;
+
+		if (q->n != 0 && q->recent_sample_count >= 4 && cur > 0 &&
+		    (sf_current_consensus_log_lat_q16 == 0 ||
+		     cur < sf_current_consensus_log_lat_q16))
+			sf_current_consensus_log_lat_q16 = cur;
+	}
+
 	int64_t means[DPA_PLUGIN_PATH_MAX];
 	int64_t qds[DPA_PLUGIN_PATH_MAX];
 	int64_t p99s[DPA_PLUGIN_PATH_MAX];
@@ -4334,6 +4595,7 @@ static inline void saps_update(volatile struct dpa_plugin_shared *s,
 	unsigned qd_valid = 0;
 	unsigned p99_valid = 0;
 	unsigned cap_valid = 0;
+	unsigned sf_latency_degraded = 0;
 	for (unsigned i = 0; i < DPA_PLUGIN_PATH_MAX; i++) {
 		struct dpa_path_state *q = &g_path[qp_idx][i];
 		if (q->n >= SAPS_WARMUP_N &&
@@ -4345,6 +4607,25 @@ static inline void saps_update(volatile struct dpa_plugin_shared *s,
 				p99s[p99_valid++] = q->p99_estimate;
 			if (q->capacity_score != 0)
 				caps[cap_valid++] = q->capacity_score;
+			bool sf_p99_degraded =
+				sf_current_consensus_log_lat_q16 > 0 &&
+				q->p99_estimate > SAPS_TAIL_LOG_LAT_Q16 &&
+				q->p99_estimate < SAPS_SHARED_FATE_TAIL_MAX_Q16 &&
+				q->mean_log_lat_ewma_q16 - sf_current_consensus_log_lat_q16 >=
+					(int64_t)SAPS_SF_LAT_BAD_DELTA_Q16 &&
+				q->p99_estimate - sf_current_consensus_log_lat_q16 >=
+					(int64_t)SAPS_CROSSPATH_DRIFT_HI_Q16;
+			bool sf_mean_degraded =
+				q->mean_log_lat_ewma_q16 > SAPS_LAT_HEALTHY_FLOOR_Q16 &&
+				((sf_current_consensus_log_lat_q16 > 0 &&
+				  q->mean_log_lat_ewma_q16 - sf_current_consensus_log_lat_q16 >=
+					  (int64_t)SAPS_CROSSPATH_DRIFT_HI_Q16) ||
+				 q->mean_log_lat_ewma_q16 - q->baseline_log_lat_q16 >=
+					 (int64_t)SAPS_SF_LAT_BAD_DELTA_Q16);
+
+			if (saps_shared_fate_path_has_latency_tail_evidence(q) &&
+			    (sf_p99_degraded || sf_mean_degraded))
+				sf_latency_degraded++;
 		}
 	}
 	int64_t median_log_lat = 0; bool median_valid = false;
@@ -4392,8 +4673,8 @@ static inline void saps_update(volatile struct dpa_plugin_shared *s,
 				median_capacity = caps[cap_valid / 2];
 				median_capacity_valid = median_capacity != 0;
 			}
-			if (valid >= DPA_PLUGIN_PATH_MAX &&
-			    min_log_lat > SAPS_LAT_HEALTHY_FLOOR_Q16)
+			if (valid >= 2 &&
+			    sf_latency_degraded >= SAPS_SHARED_FATE_DEGRADED_N)
 				all_paths_degraded = true;
 		}
 	if (p99_valid >= 2) {
@@ -4523,13 +4804,13 @@ static inline void saps_update(volatile struct dpa_plugin_shared *s,
 		p->flap_dampening_window_ms = 0;
 	}
 
-	/* 3. FSM (§4.4). */
+	/* 3. FSM (§4.4).  The per-path verdict always owns quarantine and
+	 * recovery.  SHARED_FATE runs afterward as annotation-only publication. */
+	update_state_machine(p, detector_changed, host_tsc, qp_idx, path_idx);
 	if (shared_fate) {
 		saps_shared_fate_apply(s, qp_idx, path_idx, opcode,
 				       retry_count == 0 && sct_sc == 0,
 				       log_lat, host_tsc);
-	} else {
-		update_state_machine(p, detector_changed, host_tsc, qp_idx, path_idx);
 	}
 	} /* end: !sapsq_bypass_saps_fsm */
 
@@ -4593,7 +4874,7 @@ static inline void saps_update(volatile struct dpa_plugin_shared *s,
 				s->per_qp_path_opc_p99[qp_idx][path_idx][opc] = 0;
 			} else if (p->opc_p99[opc].n > SAPS_WARMUP_N && p->opc_p99[opc].p99 > 0) {
 				s->per_qp_path_opc_p99[qp_idx][path_idx][opc] =
-					(uint32_t)(p->opc_p99[opc].p99 & 0xFFFFFFFF);
+					saps_opcode_p99_for_host(p, opc);
 			}
 		}
 	}
@@ -4677,7 +4958,7 @@ static const uint16_t LOG10_POW2_X1000[65] = {
 	19264,                                                   /* 64 */
 };
 
-static inline uint32_t log10_ns_x1000(uint64_t lat_ns)
+static inline uint32_t __attribute__((unused)) log10_ns_x1000(uint64_t lat_ns)
 {
 	if (lat_ns == 0)
 		return 0;
@@ -4687,6 +4968,12 @@ static inline uint32_t log10_ns_x1000(uint64_t lat_ns)
 	return LOG10_POW2_X1000[bl];
 }
 
+/* Legacy E1 per-QP CUSUM admission. Disabled (2026-06-23): SAPS drives steering
+ * from per_qp_path_score[] and admission from the 2D M4 path, so this CUSUM
+ * detector no longer runs. Compiled out by default; the paper describes a single
+ * cross-path detector, not this legacy per-stream one. */
+#define DPA_PLUGIN_LEGACY_E1_ADMISSION 0
+#if DPA_PLUGIN_LEGACY_E1_ADMISSION
 /* Welford online update (integer form). Latency sample already in x1000 log-ns. */
 static inline void welford_update(struct conn_stats *c, int32_t x_x1000)
 {
@@ -4733,6 +5020,7 @@ static inline void window_push(struct conn_stats *c, uint32_t x_x1000)
 	if (c->count < DPA_PLUGIN_WINDOW_K)
 		c->count++;
 }
+#endif /* DPA_PLUGIN_LEGACY_E1_ADMISSION */
 
 /* Per-event algorithm step. Called for each ring entry we consume. */
 static inline void process_event(volatile struct dpa_plugin_shared *s,
@@ -4775,6 +5063,7 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
 		 * Saturating increment — DPA uint32 submit burst cannot exceed 2^32 per epoch. */
 		if (s->sapsq_enabled) {
 			uint32_t tid = (uint32_t)qp & M3_TENANT_MASK;
+			s->dpa_submit_consumed_by_tenant[tid]++;
 			if (g_sapsq_submit_count[tid] < 0xFFFFFFFFu)
 				g_sapsq_submit_count[tid]++;
 		}
@@ -4784,10 +5073,17 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
 	/* complete — compute latency delta (low 32 bits of tsc) */
 	uint32_t submit_slot = saps_submit_slot(cid, qp_idx_real, path_idx_real);
 	uint32_t submit_low = g_submit_tsc_low[submit_slot];
-	if (submit_low == 0)
-		return; /* no matching submit */
-	g_submit_tsc_low[submit_slot] = 0;
-	uint32_t delta_ticks = (uint32_t)tsc_low - submit_low;
+	/* Error completions bypass the host sampling gate even when their
+	 * matching submission was not sampled. Their status is still valid
+	 * completion evidence, while their latency must not enter the latency
+	 * estimator. Preserve those events with a neutral non-zero delta. */
+	if (submit_low == 0 && e->sct_sc == 0)
+		return;
+	if (submit_low != 0)
+		g_submit_tsc_low[submit_slot] = 0;
+	uint32_t delta_ticks = submit_low == 0
+			      ? 1u
+			      : (uint32_t)tsc_low - submit_low;
 	if (delta_ticks == 0)
 		delta_ticks = 1;
 
@@ -4867,31 +5163,21 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
 		}
 	}
 
-	/* Legacy E1 path — per-QP CUSUM for admission control. Kept so
-	 * E3 admission gate continues to work; S3 SAPS is a parallel scoring
-	 * kernel writing per_qp_path_score[] rather than per_qp_tokens[].
-	 *
-	 * Approx: treat tsc delta as ns directly; no FPU, host_tsc units are
-	 * whatever spdk_get_ticks returns. log10 of a positive integer is
-	 * scale-invariant up to an additive constant, absorbed by Welford mean. */
+#if DPA_PLUGIN_LEGACY_E1_ADMISSION
+	/* Legacy E1 path — per-QP CUSUM for admission control. Disabled: SAPS
+	 * steers from per_qp_path_score[], not this per-stream CUSUM. */
 	uint32_t x = log10_ns_x1000((uint64_t)delta_ticks);
 
 	struct conn_stats *c = &g_conn[qp & DPA_PLUGIN_CONN_MASK];
 	if (c->qp_id == 0 && c->n == 0)
 		c->qp_id = qp; /* first-touch bind */
 
-	/* Welford always updates — lets mean track the current steady state.
-	 * (An earlier E1-fix1 attempt froze Welford while degraded; that
-	 * caused deadlock at QD=32 Null because CUSUM fired on the first
-	 * few samples before mean had stabilized, then stayed degraded
-	 * forever because mean never updated to the ~2µs Null baseline.) */
 	welford_update(c, (int32_t)x);
-	/* cusum_update wants a clock for the degraded_since stamp — use DPA
-	 * cycles, NOT the host_tsc from the event, because safety-valve 2 in
-	 * emit_admission_tokens reads DPA cycles. Same clock domain both
-	 * sides. Cost: one CNTVCT read per complete event (~2 ns). */
 	cusum_update(c, (int32_t)x, __dpa_thread_cycles());
 	window_push(c, x);
+#else
+	(void)delta_ticks;
+#endif
 
 	g_algo_events++;
 
@@ -5053,34 +5339,94 @@ static inline void sapsq_compute_health(volatile struct dpa_plugin_shared *s)
 		}
 	}
 
-	/* L4 trace: dump per-QP state distribution for path 1 so we can see
-	 * whether ANY QP's classifier wrote DEGRADING into the shared table.
-	 * Stride 1/64 epochs to keep volume small (~30 lines per 60s run). */
-	{
-		static uint32_t g_l4_agg_stride;
-		if ((g_l4_agg_stride++ & 0x3Fu) == 0) {
-			uint32_t st_cnt[4] = {0,0,0,0};
-			uint32_t ft_nonzero_qps = 0;
-			uint32_t worst_ft_seen = 0;
-			uint32_t active_qps = 0;
-			for (uint32_t qp = 0; qp < DPA_PLUGIN_CONN_MAX; qp++) {
-				if (g_path[qp][1].n == 0)
+#if SAPSQ_CONTINUOUS_HEALTH
+	/* Consensus-relative severity inputs (2026-06-23): each path's worst mean
+	 * log-latency across its QPs, and the cross-path minimum (best path) as the
+	 * consensus baseline. Min, not median, is the baseline so a correlated
+	 * multi-path slowdown still leaves a healthy path to measure against. The
+	 * DEGRADING latency branch maps a path's drift above this baseline to a
+	 * continuous health factor. */
+	int64_t cont_path_lat[SAPSQ_PATH_MAX];
+	bool    cont_path_valid[SAPSQ_PATH_MAX];
+	int64_t cont_base = 0;
+	bool    cont_base_valid = false;
+	for (uint32_t cp = 0; cp < SAPSQ_PATH_MAX; cp++) {
+		cont_path_valid[cp] = false;
+		cont_path_lat[cp] = 0;
+		for (uint32_t cq = 0; cq < DPA_PLUGIN_CONN_MAX; cq++) {
+			if (g_path[cq][cp].n < SAPS_WARMUP_N)
+				continue;
+			int64_t l = g_path[cq][cp].mean_log_lat_ewma_q16;
+			if (!cont_path_valid[cp] || l > cont_path_lat[cp]) {
+				cont_path_lat[cp] = l;
+				cont_path_valid[cp] = true;
+			}
+		}
+		if (cont_path_valid[cp] &&
+		    (!cont_base_valid || cont_path_lat[cp] < cont_base)) {
+			cont_base = cont_path_lat[cp];
+			cont_base_valid = true;
+		}
+	}
+#endif
+
+	/* The signal-isolation arms keep HCAA and the budget-based selector fixed.
+	 * Only the health input changes. Queue depth uses the worst smoothed
+	 * occupancy seen for each path across active QPs and normalizes it to the
+	 * cross-path median. REQUEST_RTT reuses the request completion-time plane
+	 * above without status or tail-shape classifications. */
+	uint64_t qd_path_q16[SAPSQ_PATH_MAX] = {0};
+	bool qd_path_valid[SAPSQ_PATH_MAX] = {false};
+	uint64_t qd_values[SAPSQ_PATH_MAX];
+	uint32_t qd_value_count = 0;
+	uint64_t qd_reference_q16 = 0;
+	int64_t rtt_path_drift_q16[SAPSQ_PATH_MAX] = {0};
+	bool rtt_path_valid[SAPSQ_PATH_MAX] = {false};
+	uint32_t configured_paths = s->sapsq_num_paths;
+	if (configured_paths > SAPSQ_PATH_MAX)
+		configured_paths = SAPSQ_PATH_MAX;
+	if (s->sapsq_health_source == SAPSQ_HEALTH_SOURCE_QUEUE_DEPTH) {
+		for (uint32_t cp = 0; cp < configured_paths; cp++) {
+			for (uint32_t cq = 0; cq < DPA_PLUGIN_CONN_MAX; cq++) {
+				if (g_path[cq][cp].n < SAPS_WARMUP_N ||
+				    g_path[cq][cp].qd_mean < 0)
 					continue;
-				active_qps++;
-				uint16_t st = s->per_qp_path_state[qp][1];
-				uint16_t ft = s->per_qp_path_fault_type[qp][1];
-				if (st < 4u) st_cnt[st]++;
-				if (ft != SAPS_FAULT_HEALTHY) {
-					ft_nonzero_qps++;
-					if (ft > worst_ft_seen) worst_ft_seen = ft;
+				uint64_t qd = (uint64_t)g_path[cq][cp].qd_mean;
+				if (!qd_path_valid[cp] || qd > qd_path_q16[cp]) {
+					qd_path_q16[cp] = qd;
+					qd_path_valid[cp] = true;
 				}
 			}
-			flexio_dev_print(
-				"[L4_AGG] path=1 active_qps=%u st_h=%u st_d=%u st_e=%u st_r=%u "
-				"ft_bad_qps=%u worst_ft=%u agg_state=%u agg_fault=%u\n",
-				active_qps, st_cnt[0], st_cnt[2], st_cnt[3], st_cnt[1],
-				ft_nonzero_qps, worst_ft_seen,
-				(unsigned)agg[1].worst_state, (unsigned)agg[1].worst_fault);
+			if (qd_path_valid[cp])
+				qd_values[qd_value_count++] = qd_path_q16[cp];
+		}
+		for (uint32_t i = 1; i < qd_value_count; i++) {
+			uint64_t key = qd_values[i];
+			int j = (int)i - 1;
+			while (j >= 0 && qd_values[j] > key) {
+				qd_values[j + 1] = qd_values[j];
+				j--;
+			}
+			qd_values[j + 1] = key;
+		}
+		if (qd_value_count != 0)
+			qd_reference_q16 = qd_values[qd_value_count / 2];
+	}
+	if (s->sapsq_health_source == SAPSQ_HEALTH_SOURCE_REQUEST_RTT) {
+		for (uint32_t cp = 0; cp < configured_paths; cp++) {
+			for (uint32_t cq = 0; cq < DPA_PLUGIN_CONN_MAX; cq++) {
+				if (g_path[cq][cp].n < SAPS_WARMUP_N ||
+				    g_path[cq][cp].baseline_log_lat_q16 == 0)
+					continue;
+				int64_t drift =
+					g_path[cq][cp].mean_log_lat_ewma_q16 -
+					g_path[cq][cp].baseline_log_lat_q16;
+				if (!rtt_path_valid[cp] ||
+				    drift > rtt_path_drift_q16[cp]) {
+					rtt_path_drift_q16[cp] = drift;
+					rtt_path_valid[cp] = true;
+				}
+			}
 		}
 	}
 
@@ -5101,6 +5447,39 @@ static inline void sapsq_compute_health(volatile struct dpa_plugin_shared *s)
 		 * scheduler can hand out budget on a freshly-brought-up path. */
 		uint16_t st = agg[p].any_qp_active ? agg[p].worst_state : DPA_SAPS_STATE_HEALTHY;
 		uint16_t ft = agg[p].any_qp_active ? agg[p].worst_fault : SAPS_FAULT_HEALTHY;
+
+		if (s->sapsq_health_source !=
+		    SAPSQ_HEALTH_SOURCE_COMPLETION) {
+			if (p >= configured_paths) {
+				hf_q16 = SAPSQ_HEALTH_HEALTHY_Q16;
+			} else if (s->sapsq_health_source ==
+				   SAPSQ_HEALTH_SOURCE_QUEUE_DEPTH) {
+				hf_q16 = qd_path_valid[p]
+					? sapsq_queue_depth_health(
+						qd_reference_q16,
+						qd_path_q16[p])
+					: SAPSQ_HEALTH_HEALTHY_Q16;
+			} else if (s->sapsq_health_source ==
+				   SAPSQ_HEALTH_SOURCE_REQUEST_RTT) {
+#if SAPSQ_CONTINUOUS_HEALTH
+				hf_q16 = rtt_path_valid[p]
+					? sapsq_continuous_health_from_drift(
+						rtt_path_drift_q16[p])
+					: SAPSQ_HEALTH_HEALTHY_Q16;
+#else
+				hf_q16 = SAPSQ_HEALTH_HEALTHY_Q16;
+#endif
+			} else {
+				hf_q16 = SAPSQ_HEALTH_HEALTHY_Q16;
+			}
+			h_enum = hf_q16 < SAPSQ_HEALTH_HEALTHY_Q16 ? 2 : 0;
+			s->sapsq_path_health_q16[p] = hf_q16;
+			s->sapsq_path_eligibility[p] = SAPSQ_ELIG_NORMAL;
+			s->sapsq_path_health[p] = h_enum;
+			s->sapsq_path_health_factor_q16[p] = hf_q16;
+			g_sapsq_recover_ramp_q16[p] = 0;
+			continue;
+		}
 
 		/* REVERTED 2026-05-25 evening: Earlier this session I added a
 		 * fault-driven early demotion bypass here. It worked for E3 single-
@@ -5215,13 +5594,49 @@ static inline void sapsq_compute_health(volatile struct dpa_plugin_shared *s)
 		s->sapsq_path_health_q16[p] = health_q16;
 		s->sapsq_path_eligibility[p] = elig;
 
-		/* Slice 4: populate sapsq_path_health[p] + sapsq_path_health_factor_q16[p].
-		 * DEGRADING is further split by fault type; RECOVERING is fixed 0.3
-		 * (hysteretic ramp already in sapsq_path_health_q16 via old path). */
+		/* Populate the M-series health plane. DEGRADING is split by signal
+		 * type. RECOVERING reuses the hysteretic ramp computed above so both
+		 * allocator planes expose the same recovery semantics. */
 		switch (st) {
 		case DPA_SAPS_STATE_HEALTHY:
-			h_enum = 0; hf_q16 = 65536u; break;  /* 1.0 */
+#if SAPSQ_CONTINUOUS_HEALTH
+			/* Keep the discrete FSM stable under short-lived estimator noise,
+			 * but do not discard strong consensus-relative latency evidence.
+			 * A capacity-shaped verdict can keep the FSM HEALTHY even after
+			 * steering drains the path. Fresh sentinel completions still
+			 * update the continuous factor used by allocation. */
+			if (cont_path_valid[p] && cont_base_valid) {
+				int64_t drift = cont_path_lat[p] - cont_base;
+				hf_q16 = sapsq_continuous_health_from_drift(drift);
+				h_enum = hf_q16 < SAPSQ_HEALTH_HEALTHY_Q16 ? 2 : 0;
+			} else {
+				h_enum = 0;
+				hf_q16 = SAPSQ_HEALTH_HEALTHY_Q16;
+			}
+#else
+			h_enum = 0;
+			hf_q16 = SAPSQ_HEALTH_HEALTHY_Q16;
+#endif
+			break;
 		case DPA_SAPS_STATE_DEGRADING:
+#if SAPSQ_CONTINUOUS_HEALTH
+			/* Latency-magnitude faults take a continuous consensus-relative
+			 * health (drift above the cross-path best path). Tail-shape (bimodal)
+			 * and protocol-error faults are not latency-drift visible, so they
+			 * keep their signal-specific factor until the tail-drift increment. */
+			if (ft == SAPS_FAULT_BIMODAL_TAIL) {
+				h_enum = 3; hf_q16 = 45875u;       /* 0.7, tail-shape */
+			} else if (ft == SAPS_FAULT_SPARSE_ERROR) {
+				h_enum = 4; hf_q16 = 3277u;        /* 0.05, protocol error */
+			} else if (!cont_path_valid[p] || !cont_base_valid) {
+				h_enum = 1; hf_q16 = 32768u;       /* no latency evidence yet */
+			} else {
+				int64_t drift = cont_path_lat[p] - cont_base;
+				h_enum = 2;
+				hf_q16 = sapsq_continuous_health_from_drift(drift);
+			}
+			break;
+#else
 			switch (ft) {
 			case SAPS_FAULT_ONSET:
 				h_enum = 1; hf_q16 = 32768u; break;  /* 0.5 */
@@ -5237,8 +5652,9 @@ static inline void sapsq_compute_health(volatile struct dpa_plugin_shared *s)
 				h_enum = 1; hf_q16 = 32768u; break;  /* 0.5 */
 			}
 			break;
+#endif
 		case DPA_SAPS_STATE_RECOVERING:
-			h_enum = 5; hf_q16 = 19661u; break;  /* 0.3 fixed per slice 4 spec */
+			h_enum = 5; hf_q16 = health_q16; break;
 		case DPA_SAPS_STATE_EXCLUDED:
 			h_enum = 6; hf_q16 = 0u;     break;  /* quarantine */
 		default:
@@ -5435,7 +5851,8 @@ static inline bool sapsq_run_epoch(volatile struct dpa_plugin_shared *s,
 	/* Observability: confirm the function is reached at all (before any
 	 * early-exit checks). Stride 1/1000 keeps log spam bounded at >1M IOPS. */
 	static uint32_t sapsq_enter_count = 0;
-	if ((sapsq_enter_count++ % 1000u) == 0) {
+	if (SAPS_DPA_DIAGNOSTIC_PRINTS &&
+	    (sapsq_enter_count++ % 1000u) == 0) {
 		flexio_dev_print("dpa_plugin: sapsq entered count=%u events_seen=%u "
 				 "interval=%u enabled=%u\n",
 				 (unsigned)sapsq_enter_count,
@@ -5512,7 +5929,8 @@ static inline bool sapsq_run_epoch(volatile struct dpa_plugin_shared *s,
 	 * + path health/eligibility so we can diagnose weighted-allocator output.
 	 * Stride 1/100 keeps log volume small even if scheduler fires often. */
 	static uint32_t sapsq_log_count = 0;
-	if ((sapsq_log_count++ % 100u) == 0) {
+	if (SAPS_DPA_DIAGNOSTIC_PRINTS &&
+	    (sapsq_log_count++ % 100u) == 0) {
 		uint32_t mt = s->sapsq_my_tenant_id;
 		if (mt >= SAPSQ_TENANT_MAX)
 			mt = 0;
@@ -5550,11 +5968,11 @@ static inline bool sapsq_run_epoch(volatile struct dpa_plugin_shared *s,
  * sapsq_tenant_path_rate_q32[16][4].  Both coexist; slice 3 (host enforcement)
  * will switch the token-bucket path to read from the new 8-path budget plane.
  *
- * Demand source: g_sapsq_submit_count[t] — DPA-local per-tenant counter
- *   incremented in process_event() on kind==0 (submit) events, using
- *   (qp_id & M3_TENANT_MASK) as tenant_id.  This matches the M3/M4 convention.
+ * Demand source: sapsq_host_submit_count[t] — host-published admission
+ *   attempts measured before enforcement. Counting only admitted submissions
+ *   would make a throttled tenant appear idle and reduce its next budget.
  *
- * Path capacity: sapsq_link_cap_iops / num_paths × health_factor_q16[p] / Q16.
+ * Path capacity: sapsq_path_capacity_iops[p] × health_factor_q16[p] / Q16.
  *   health_factor_q16[p] is initialised to SAPSQ_HEALTH_HEALTHY_Q16 (65536) by
  *   host at start-up; slice 4 (D-classifier bridge) overwrites it dynamically.
  *   Slice 2 placeholder: all paths HEALTHY → cap evenly split.
@@ -5588,25 +6006,13 @@ static void sapsq_update_demand_ewma(volatile struct dpa_plugin_shared *s,
 		num_t = SAPSQ_MAX_TENANTS;
 
 	for (uint32_t t = 0; t < num_t; t++) {
-		/* Lane BBB-V2: switch back to DPA-local g_sapsq_submit_count.
-		 *
-		 * Lane U used host-written sapsq_host_submit_count because of a
-		 * "coordinator VA / tenant alias VA mismatch" concern (Lane T).
-		 * In E4 single-DPA-process architecture ALL qpairs (coordinator +
-		 * tenants) are serviced by the same DPA process_event() context —
-		 * g_sapsq_submit_count is incremented in that same context and is
-		 * always coherent for the scheduler_tick that also runs there.
-		 *
-		 * The host-side counter (sapsq_host_submit_count) requires dc cvac
-		 * flushes from the ARM host CPU to DRAM before DPA can observe it
-		 * via PCIe window.  In practice dc cvac only guarantees flush to
-		 * LLC (not DRAM/PCIe-visible), so DPA sees stale zeros for seconds
-		 * at a time until a DPA lease-renew gap forces all pending writes
-		 * to propagate (observed: t0_cur=3 for 1800+ ticks, then jumps to
-		 * 497651).  Using the DPA-local counter eliminates this latency. */
-		uint64_t cur_local = (uint64_t)g_sapsq_submit_count[t];
-		uint64_t delta_host = cur_local - g_sapsq_host_submit_last[t];
-		g_sapsq_host_submit_last[t] = cur_local;
+		/* Host processes publish offered attempts in cache-cleaned batches.
+		 * The counter is monotone and remains independent of the admission
+		 * decision made from the previous budget. */
+		uint64_t cur_host = s->sapsq_host_submit_count[t];
+		uint64_t prev_host = g_sapsq_host_submit_last[t];
+		uint64_t delta_host = cur_host - prev_host;
+		g_sapsq_host_submit_last[t] = cur_host;
 		/* DIAG Lane BBB-V3 DISABLED (E2 work-conserving fix, 2026-05-29):
 		 * flexio_dev_print() inside the scheduler tick BLOCKS when the DPA->host
 		 * message ring fills (see file-header WARNING).  Diagnosis of
@@ -5676,8 +6082,27 @@ static void sapsq_update_demand_ewma(volatile struct dpa_plugin_shared *s,
 	}
 }
 
-/* Compute per-path effective capacity from link cap, path count, and health.
- * cap_eff_out[p] = (link_cap_iops / num_p) × health_factor_q16[p] / 65536.
+static inline uint32_t
+sapsq_allocation_health_factor(volatile struct dpa_plugin_shared *s,
+			       uint32_t path)
+{
+	uint32_t observed = s->sapsq_path_health_factor_q16[path];
+
+	switch (s->sapsq_bypass_health_coupling) {
+	case SAPSQ_HEALTH_COUPLING_FIXED:
+		return observed;
+	case SAPSQ_HEALTH_COUPLING_BINARY:
+		return observed < SAPSQ_HEALTH_HEALTHY_Q16
+		       ? SAPSQ_HEALTH_QUARANTINE
+		       : SAPSQ_HEALTH_HEALTHY_Q16;
+	case SAPSQ_HEALTH_COUPLING_CONTINUOUS:
+	default:
+		return observed;
+	}
+}
+
+/* Compute per-path effective capacity from deliverable capacity and health.
+ * cap_eff_out[p] = path_capacity_iops[p] × health_factor_q16[p] / 65536.
  * Result is IO/s (Q0 integer, same unit as sapsq_demand_ewma_q32).
  */
 static void sapsq_compute_path_capacity(volatile struct dpa_plugin_shared *s,
@@ -5686,18 +6111,19 @@ static void sapsq_compute_path_capacity(volatile struct dpa_plugin_shared *s,
 	uint32_t num_p = s->sapsq_num_paths;
 	if (num_p == 0 || num_p > SAPSQ_MAX_PATHS)
 		num_p = SAPSQ_MAX_PATHS;
-	uint64_t link_cap = s->sapsq_link_cap_iops;
-	/* Base per-path share: integer division floors.  Safe for num_p ≤ 8. */
-	uint64_t base = (num_p > 0) ? (link_cap / num_p) : 0;
 
 	for (uint32_t p = 0; p < SAPSQ_MAX_PATHS; p++) {
 		if (p >= num_p) {
 			cap_eff_out[p] = 0;
 			continue;
 		}
-		uint32_t hf = s->sapsq_path_health_factor_q16[p];
-		/* Q16 multiply: (base × hf) >> 16 */
-		uint64_t eff = (base * (uint64_t)hf) >> 16;
+		uint32_t hf = sapsq_allocation_health_factor(s, p);
+		uint64_t path_cap = s->sapsq_path_capacity_iops[p];
+		/* Missing K_p is an invalid configuration. Treat it as zero capacity
+		 * instead of silently assuming K_p=C. The host initializer rejects
+		 * this configuration before enabling the scheduler. */
+		/* Q16 multiply: (K_p × h_p) >> 16 */
+		uint64_t eff = (path_cap * (uint64_t)hf) >> 16;
 		if (eff > 0xFFFFFFFFu)
 			eff = 0xFFFFFFFFu;
 		cap_eff_out[p] = (uint32_t)eff;
@@ -5714,7 +6140,7 @@ static void sapsq_compute_path_capacity(volatile struct dpa_plugin_shared *s,
  * tenant_rate_out[t] — per-tenant total allocated rate IO/s (output)
  *
  * Algorithm: Bertsekas weighted max-min.
- *   C_total = Σ cap_eff[p]
+ *   C_total = min(namespace envelope, Σ cap_eff[p])
  *   Active  = { t | demand > 0 AND weight > 0 }
  *   Sort active ascending by demand[t] / weight[t]  (insertion sort, T ≤ 16)
  *   First pass:  if demand[t] ≤ fair_share → satisfy at demand[t]
@@ -5723,6 +6149,8 @@ static void sapsq_compute_path_capacity(volatile struct dpa_plugin_shared *s,
 static void sapsq_progressive_fill(const uint32_t demand[SAPSQ_MAX_TENANTS],
 				   const uint32_t cap_eff[SAPSQ_MAX_PATHS],
 				   uint32_t num_t, uint32_t num_p,
+				   uint64_t service_envelope,
+				   bool fixed_envelope,
 				   const uint32_t weights[SAPSQ_MAX_TENANTS],
 				   uint32_t tenant_rate_out[SAPSQ_MAX_TENANTS])
 {
@@ -5734,9 +6162,14 @@ static void sapsq_progressive_fill(const uint32_t demand[SAPSQ_MAX_TENANTS],
 		return;
 
 	/* Total capacity. */
-	uint64_t c_total = 0;
-	for (uint32_t p = 0; p < num_p && p < SAPSQ_MAX_PATHS; p++)
-		c_total += cap_eff[p];
+	uint64_t c_total = service_envelope;
+	if (!fixed_envelope) {
+		c_total = 0;
+		for (uint32_t p = 0; p < num_p && p < SAPSQ_MAX_PATHS; p++)
+			c_total += cap_eff[p];
+		if (c_total > service_envelope)
+			c_total = service_envelope;
+	}
 	if (c_total == 0)
 		return;
 
@@ -5830,24 +6263,51 @@ static void sapsq_progressive_fill(const uint32_t demand[SAPSQ_MAX_TENANTS],
 static void sapsq_split_per_path(uint32_t tenant_rate,
 				 const uint32_t cap_eff[SAPSQ_MAX_PATHS],
 				 uint32_t num_p,
-				 uint32_t probe_q32,
+				 uint32_t probe_iops,
 				 uint32_t rate_out[SAPSQ_MAX_PATHS])
 {
-	/* Sum eligible-path cap. Slice 2: all paths with cap>0 are eligible. */
+	/* Probe traffic is part of the tenant's admitted rate. Reserve its bounded
+	 * share before distributing the remainder across service-capable paths.
+	 * This keeps the published matrix within both the tenant rate and the
+	 * namespace envelope. */
 	uint64_t c_sum = 0;
+	uint32_t probe_paths = 0;
 	for (uint32_t p = 0; p < num_p && p < SAPSQ_MAX_PATHS; p++)
-		c_sum += cap_eff[p];
+		if (cap_eff[p] == 0)
+			probe_paths++;
+		else
+			c_sum += cap_eff[p];
+
+	uint64_t requested_probe = (uint64_t)probe_iops * probe_paths;
+	if (requested_probe > tenant_rate)
+		requested_probe = tenant_rate;
+	uint32_t probe_each = probe_paths
+			      ? (uint32_t)(requested_probe / probe_paths)
+			      : 0;
+	uint32_t probe_remainder = probe_paths
+				   ? (uint32_t)(requested_probe % probe_paths)
+				   : 0;
+	uint32_t remaining_rate = tenant_rate - (uint32_t)requested_probe;
 
 	for (uint32_t p = 0; p < SAPSQ_MAX_PATHS; p++) {
 		if (p >= num_p) {
 			rate_out[p] = 0;
 			continue;
 		}
-		if (c_sum == 0 || cap_eff[p] == 0) {
-			rate_out[p] = probe_q32;  /* liveness probe */
+		if (cap_eff[p] == 0) {
+			rate_out[p] = probe_each;
+			if (probe_remainder != 0) {
+				rate_out[p]++;
+				probe_remainder--;
+			}
 			continue;
 		}
-		uint64_t share = ((uint64_t)tenant_rate * cap_eff[p]) / c_sum;
+		if (c_sum == 0) {
+			rate_out[p] = 0;
+			continue;
+		}
+		uint64_t share =
+			((uint64_t)remaining_rate * cap_eff[p]) / c_sum;
 		if (share > 0xFFFFFFFFu)
 			share = 0xFFFFFFFFu;
 		rate_out[p] = (uint32_t)share;
@@ -5879,7 +6339,8 @@ static void sapsq_split_per_path(uint32_t tenant_rate,
  * Conversion: rate_q32 = iops * 2^32 / tsc_freq.
  */
 static void sapsq_publish_budgets(volatile struct dpa_plugin_shared *s,
-				  const uint32_t rates[SAPSQ_MAX_TENANTS][SAPSQ_MAX_PATHS])
+				  const uint32_t rates[SAPSQ_MAX_TENANTS][SAPSQ_MAX_PATHS],
+				  const uint32_t cap_eff[SAPSQ_MAX_PATHS])
 {
 	uint32_t new_seq = s->sapsq_epoch_seq + 1u;
 	s->sapsq_epoch_seq = new_seq;
@@ -5895,6 +6356,12 @@ static void sapsq_publish_budgets(volatile struct dpa_plugin_shared *s,
 	uint64_t tsc_freq = s->sapsq_host_tsc_freq;
 	if (tsc_freq == 0)
 		tsc_freq = 1500000000ULL;  /* 1.5 GHz fallback */
+
+	for (uint32_t p = 0; p < SAPSQ_MAX_PATHS; p++) {
+		s->sapsq_committed_path_health_factor_q16[p] =
+			sapsq_allocation_health_factor(s, p);
+		s->sapsq_committed_path_effective_capacity_iops[p] = cap_eff[p];
+	}
 
 	for (uint32_t t = 0; t < SAPSQ_MAX_TENANTS; t++) {
 		for (uint32_t p = 0; p < SAPSQ_MAX_PATHS; p++) {
@@ -5976,18 +6443,29 @@ static void sapsq_scheduler_tick(volatile struct dpa_plugin_shared *s,
 	}
 
 	uint32_t tenant_rate[SAPSQ_MAX_TENANTS];
-	sapsq_progressive_fill(demand, cap_eff, num_t, num_p, weights, tenant_rate);
+	bool fixed_envelope = s->sapsq_bypass_health_coupling ==
+			      SAPSQ_HEALTH_COUPLING_FIXED;
+	sapsq_progressive_fill(demand, cap_eff, num_t, num_p,
+			      s->sapsq_link_cap_iops, fixed_envelope,
+			      weights, tenant_rate);
 
 	/* Step 4: split each tenant's rate across paths. */
 	uint32_t probe_q32 = s->sapsq_probe_rate_budget_q32;
+	uint64_t probe_iops_u64 =
+		((uint64_t)probe_q32 * tsc_freq) >> 32;
+	if (probe_q32 != 0 && probe_iops_u64 == 0)
+		probe_iops_u64 = 1;
+	if (probe_iops_u64 > 0xFFFFFFFFu)
+		probe_iops_u64 = 0xFFFFFFFFu;
+	uint32_t probe_iops = (uint32_t)probe_iops_u64;
 	uint32_t rates[SAPSQ_MAX_TENANTS][SAPSQ_MAX_PATHS];
 	for (uint32_t t = 0; t < SAPSQ_MAX_TENANTS; t++) {
 		sapsq_split_per_path(tenant_rate[t], cap_eff, num_p,
-				     probe_q32, rates[t]);
+				     probe_iops, rates[t]);
 	}
 
 	/* Step 5: publish to shared struct with epoch barrier. */
-	sapsq_publish_budgets(s, rates);
+	sapsq_publish_budgets(s, rates, cap_eff);
 }
 
 /* ── M5 v3 DPA-side proactive DRR scheduler — elapsed-TSC rate-based ─────────
@@ -6234,6 +6712,17 @@ __dpa_rpc__ uint64_t dpa_plugin_rpc(uint64_t in_daddr)
 		__builtin_memset(g_shared_fate_until_tsc, 0, sizeof(g_shared_fate_until_tsc));
 		__builtin_memset(g_shared_fate_last_excluded_plus1, 0,
 				 sizeof(g_shared_fate_last_excluded_plus1));
+		__builtin_memset(g_sapsq_submit_count, 0,
+				 sizeof(g_sapsq_submit_count));
+		__builtin_memset(g_sapsq_demand_ewma_q32, 0,
+				 sizeof(g_sapsq_demand_ewma_q32));
+		__builtin_memset(g_sapsq_zero_epochs, 0,
+				 sizeof(g_sapsq_zero_epochs));
+		__builtin_memset(g_sapsq_host_submit_last, 0,
+				 sizeof(g_sapsq_host_submit_last));
+		__builtin_memset(g_sapsq_recover_ramp_q16, 0,
+				 sizeof(g_sapsq_recover_ramp_q16));
+		g_sapsq_tick_last_tsc = 0;
 		g_algo_events = 0;
 		g_algo_degraded_transitions = 0;
 		g_algo_sv1_bypass_admits = 0;
@@ -6250,9 +6739,13 @@ __dpa_rpc__ uint64_t dpa_plugin_rpc(uint64_t in_daddr)
 	uint64_t consumed  = s->consumer_idx;
 	uint64_t last_prod = s->producer_idx;
 
-	flexio_dev_print("dpa_plugin: DPA RPC entered (consumed=%lu prod=%lu algo_ev=%lu)\n",
-			 (unsigned long)consumed, (unsigned long)last_prod,
-			 (unsigned long)g_algo_events);
+	if (SAPS_DPA_DIAGNOSTIC_PRINTS) {
+		flexio_dev_print(
+			"dpa_plugin: DPA RPC entered "
+			"(consumed=%lu prod=%lu algo_ev=%lu)\n",
+			(unsigned long)consumed, (unsigned long)last_prod,
+			(unsigned long)g_algo_events);
+	}
 
 	uint32_t outer = 0;
 	/* Time-based lease budget (E2 work-conserving root-cause fix, 2026-05-29):
@@ -6352,21 +6845,28 @@ __dpa_rpc__ uint64_t dpa_plugin_rpc(uint64_t in_daddr)
 		if (outer >= DPA_LEASE_OUTER ||
 		    (__dpa_thread_cycles() - lease_start_cycles) >= lease_max_cycles) {
 			__dpa_thread_window_writeback();
-			flexio_dev_print("dpa_plugin: lease renew (outer=%u consumed=%lu prod=%lu algo_ev=%lu deg=%lu sv1=%lu sv2=%lu thr_wr=%lu adm_wr=%lu)\n",
-					 (unsigned)outer,
-					 (unsigned long)consumed,
-					 (unsigned long)last_prod,
-					 (unsigned long)g_algo_events,
-					 (unsigned long)g_algo_degraded_transitions,
-					 (unsigned long)g_algo_sv1_bypass_admits,
-					 (unsigned long)g_algo_sv2_auto_release,
-					 (unsigned long)g_algo_throttle_writes,
-					 (unsigned long)g_algo_admit_writes);
-			flexio_dev_print("SAPS_SAMPLE sample_events=%lu classify_state=%lu score_updates=%lu healthy_full_bypass=%lu\n",
-					 (unsigned long)g_saps_sample_events,
-					 (unsigned long)g_saps_classify_calls,
-					 (unsigned long)g_saps_score_updates,
-					 (unsigned long)s->saps_healthy_full_bypass_count);
+			if (SAPS_DPA_DIAGNOSTIC_PRINTS) {
+				flexio_dev_print(
+					"dpa_plugin: lease renew "
+					"(outer=%u consumed=%lu prod=%lu algo_ev=%lu "
+					"deg=%lu sv1=%lu sv2=%lu thr_wr=%lu adm_wr=%lu)\n",
+					(unsigned)outer,
+					(unsigned long)consumed,
+					(unsigned long)last_prod,
+					(unsigned long)g_algo_events,
+					(unsigned long)g_algo_degraded_transitions,
+					(unsigned long)g_algo_sv1_bypass_admits,
+					(unsigned long)g_algo_sv2_auto_release,
+					(unsigned long)g_algo_throttle_writes,
+					(unsigned long)g_algo_admit_writes);
+				flexio_dev_print(
+					"SAPS_SAMPLE sample_events=%lu classify_state=%lu "
+					"score_updates=%lu healthy_full_bypass=%lu\n",
+					(unsigned long)g_saps_sample_events,
+					(unsigned long)g_saps_classify_calls,
+					(unsigned long)g_saps_score_updates,
+					(unsigned long)s->saps_healthy_full_bypass_count);
+			}
 			return DPA_LEASE_CONTINUE;
 		}
 	}

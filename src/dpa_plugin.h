@@ -131,6 +131,18 @@ struct spdk_nvme_qpair;
 int dpa_plugin_admission_check(struct spdk_nvme_qpair *qpair,
 			       uint16_t qp_id_fallback, uint32_t nbytes);
 
+/* Read the current process tenant's committed SAPS-Q per-path budgets.
+ *
+ * Returns the number of valid path entries copied into budget_q32. Returns 0
+ * while SAPS-Q is disabled, before the first budget epoch is committed, or
+ * when no non-zero budget is available. The selector uses this row to make
+ * its path-choice weights agree with the admission plane that enforces the
+ * same row after a qpair has been selected.
+ */
+int dpa_plugin_read_sapsq_budget_row(uint32_t *budget_q32,
+				     uint32_t max_paths);
+uint32_t dpa_plugin_read_sapsq_probe_rate_q32(void);
+
 /* SAPS-Q (2026-05-22) — host-side qpair→path_id mapping.
  *
  * Background: SPDK assigns qpair->id per-controller starting at 1, so for
@@ -147,7 +159,7 @@ int dpa_plugin_admission_check(struct spdk_nvme_qpair *qpair,
  *      "<port>:<path_id>,<port>:<path_id>,..." and use that map.
  *   2. Otherwise, fall back to formula path_id = (port - 4430) / 10,
  *      clamped to [0, DPA_PLUGIN_PATH_MAX - 1]. This matches the
- *      node1 setup_arm1_sapsq_4t3p.sh layout where path A uses
+ *      arm-1 setup_arm1_sapsq_4t3p.sh layout where path A uses
  *      4430-4433, path B uses 4440-4443, path C uses 4450-4453.
  *
  * Hashmap implementation: open-addressed linear-probing table of 64
@@ -199,6 +211,7 @@ struct dpa_plugin_path_snapshot {
 	uint32_t opc_p99;
 	uint32_t capacity;
 	uint16_t fault_type;
+	uint16_t state;
 };
 
 /* Round 11 D0 hot-path: read all selector fields for one path through a

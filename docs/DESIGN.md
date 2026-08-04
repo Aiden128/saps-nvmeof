@@ -1,231 +1,112 @@
-# SAPS-Q Algorithm-Level Architecture
+# SAPS control-loop design
 
-Date: 2026-05-26
-Scope: current M-series / SAPS-Q algorithm path
+SAPS coordinates path selection and tenant scheduling through one representation
+of deliverable path capacity. The controller receives completion observations,
+estimates path health, computes a feasible namespace budget, and publishes a
+per-tenant, per-path rate matrix. The submission path consumes that matrix
+without recomputing policy.
 
-This diagram expands the algorithm path behind SAPS-Q: how IO events become
-path health, how path health becomes a tenant/path rate matrix, and how the host
-enforces that matrix safely.
+## System model
 
-## ASCII Version
+A namespace is reachable through a set of paths `P` and shared by a set of
+tenants `T`.
 
-```text
-                         SAPS-Q ALGORITHM-LEVEL ARCHITECTURE
+- `K_p` is the provisioned deliverable capacity of path `p`.
+- `h_p` is the current health estimate for path `p`, bounded by zero and one.
+- `C` is the service envelope configured for the namespace.
+- `d_t` and `w_t` are tenant demand and weight.
+- `r_t` is the admitted tenant rate.
+- `x_t,p` is the rate assigned to tenant `t` on path `p`.
 
-  HOST IO FAST PATH                         SHARED MEMORY / MEMFD                 DPA EPOCH ALGORITHM
-  -----------------                         --------------------                 -------------------
+The controller does not estimate `K_p` from traffic after steering. Moving
+work away from a path would otherwise make that path appear to have less
+capacity. `K_p` therefore comes from provisioning or an independent capacity
+measurement.
 
-  submit(req)
-    |
-    |  fields:
-    |  tenant_id, qp_id, path_id,
-    |  opcode, nbytes, submit_tsc
-    v
-  +----------------------+        write       +----------------------+      read       +----------------------+
-  | host event producer  | -----------------> | IO event ring        | -------------> | DPA process_event()  |
-  | sample submit events |                    | sampled events       |                | update per-QP/path   |
-  +----------------------+                    +----------------------+                | latency/status stats |
-                                                                                     +----------+-----------+
-                                                                                                |
-                                                                                                v
-  complete(req)                                                                      +----------------------+
-    |                                                                                | per-QP/per-path      |
-    |  fields:                                                                       | classifier state     |
-    |  complete_tsc, status, latency                                                 |                      |
-    v                                                                                | EWMA / NEWMA / P99   |
-  +----------------------+        write       +----------------------+      read       | FSM state            |
-  | host event producer  | -----------------> | IO event ring        | -------------> | fault_type           |
-  | sample complete evts |                    | submit + complete    |                | retry verdict        |
-  +----------------------+                    +----------------------+                +----------+-----------+
-                                                                                                |
-                                                                                                |
-                                                                                                v
-                                                                                     +----------------------+
-                                                                                     | epoch trigger        |
-                                                                                     |                      |
-                                                                                     | if event_count >= N  |
-                                                                                     | or TSC fallback hit  |
-                                                                                     | then run scheduler   |
-                                                                                     +----------+-----------+
-                                                                                                |
-                                                                                                v
-                                                                                     +----------------------+
-                                                                                     | sapsq_compute_health |
-                                                                                     |                      |
-                                                                                     | for each path p:     |
-                                                                                     |  1. scan active QPs  |
-                                                                                     |  2. take worst FSM   |
-                                                                                     |  3. keep bad fault   |
-                                                                                     |  4. map to health    |
-                                                                                     |     and eligibility  |
-                                                                                     +----------+-----------+
-                                                                                                |
-                                                      health[p], eligibility[p]                  |
-                                                                                                v
-                                                                                     +----------------------+
-                                                                                     | health mapping       |
-                                                                                     |                      |
-                                                                                     | HEALTHY    -> 1.0 N  |
-                                                                                     | DEGRADING -> fault   |
-                                                                                     |              specific|
-                                                                                     | EXCLUDED   -> Q/P    |
-                                                                                     | RECOVERING -> ramp   |
-                                                                                     +----------+-----------+
-                                                                                                |
-                                                                                                v
-                                                                                     +----------------------+
-                                                                                     | effective capacity   |
-                                                                                     |                      |
-                                                                                     | C[p] = base[p]       |
-                                                                                     |      * health[p]     |
-                                                                                     | quarantine -> 0      |
-                                                                                     | probe -> probe floor |
-                                                                                     +----------+-----------+
-                                                                                                |
-                                                                                                v
-                                                                                     +----------------------+
-                                                                                     | sapsq_allocate()     |
-                                                                                     | weighted max-min     |
-                                                                                     | progressive fill     |
-                                                                                     +----------+-----------+
-                                                                                                |
-                                            +---------------------------------------------------+-------------------+
-                                            |                                                                       |
-                                            v                                                                       v
-                              +----------------------------+                                       +----------------------------+
-                              | tenant allocation          |                                       | path split                 |
-                              |                            |                                       |                            |
-                              | active if w[t] > 0        |                                       | x[t,p] = r[t] * C[p]      |
-                              | and demand[t] > 0         |                                       |          / sum(C[eligible])|
-                              |                            |                                       | quarantine path -> 0       |
-                              | sort by demand[t] / w[t]  |                                       | probe path gets floor      |
-                              | satisfy low demand first  |                                       +--------------+-------------+
-                              | split rest by weight      |                                                      |
-                              +-------------+--------------+                                                      |
-                                            |                                                                     |
-                                            +---------------------------+-----------------------------------------+
-                                                                        |
-                                                                        v
-                                                          +----------------------------+
-                                                          | tenant_path_rate_q32[t][p] |
-                                                          | path_health_q16[p]         |
-                                                          | path_eligibility[p]        |
-                                                          +-------------+--------------+
-                                                                        |
-                                                                        | stable publication:
-                                                                        | write matrix
-                                                                        | writeback + release fence
-                                                                        | commit epoch
-                                                                        | writeback commit group
-                                                                        v
-  HOST ENFORCEMENT                         SHARED MEMORY / MEMFD
-  ----------------                         --------------------
+## Completion-driven health
 
-  +----------------------+       read       +----------------------------+
-  | admission_check()    | <--------------- | committed epoch            |
-  | on every submit      |                  | rates / health / elig      |
-  +----------+-----------+                  +----------------------------+
-             |
-             v
-  +----------------------+
-  | stale epoch check    |
-  |                      |
-  | if stale:            |
-  |   fallback to M4     |
-  |   static rates       |
-  | else: use SAPS-Q     |
-  +----------+-----------+
-             |
-             v
-  +----------------------+
-  | token refresh        |
-  |                      |
-  | dt = host_tsc - last |
-  | tokens[t,p] +=       |
-  |   rate[t,p] * dt     |
-  | cost = max(1,        |
-  |   nbytes / 4096)     |
-  +----------+-----------+
-             |
-             v
-  +----------------------+          enough tokens          +----------------------+
-  | token decision       | ------------------------------> | admit IO             |
-  |                      |                                 | consume tokens       |
-  | if tokens >= cost    |                                 | admit_count[t,p]++   |
-  | else reject          |                                 +----------------------+
-  +----------+-----------+
-             |
-             | not enough tokens
-             v
-  +----------------------+
-  | return -EAGAIN       |
-  | reject_count[t,p]++  |
-  | SPDK queued_req      |
-  | timer drain resubmit |
-  +----------------------+
+The host records sampled submissions and completions in a shared ring. A DPA
+polling loop consumes those records and maintains state for each path.
+Completion status distinguishes protocol outcomes that reachability, queue
+occupancy, and timing alone cannot express. Relative latency and tail behavior
+capture reachable but degraded paths.
 
+The estimator publishes a dimensionless health value. A healthy path has health
+one. A degraded path receives a graded value below one. A path that should not
+carry bulk traffic reaches zero effective capacity and receives only a bounded
+recovery probe.
 
-  OBSERVABILITY / EXPERIMENT GATE
-  -------------------------------
+## Health-coupled adaptive allocation
 
-  +----------------------+       dump       +----------------------+       aggregate       +----------------------+
-  | sapsq_dump           | <--------------- | shared counters      | -------------------> | aggregate_sapsq.py  |
-  | start/end snapshots  |                  | admit/reject/probe   |                      | E1/E2/E3 verdicts   |
-  +----------------------+                  | epochs/stale fallback|                      | no fake per_path_pct|
-                                            +----------------------+                      +----------+-----------+
-                                                                                                    |
-                                                                                                    v
-                                                                                     +----------------------+
-                                                                                     | paper-grade rule     |
-                                                                                     |                      |
-                                                                                     | per_path_pct must    |
-                                                                                     | come from observed   |
-                                                                                     | admit_delta only     |
-                                                                                     +----------------------+
-
-
-  CURRENT FAILURE POINT
-  ---------------------
-
-  The D classifier can label healthy saturated multi-tenant paths as SHARED_FATE.
-  That bad fault_type contaminates health[p], then C[p], then x[t,p], so E3 cannot
-  defend "SAPS-Q rerouted because of real path-health signal" yet.
-```
-
-## Compact Algorithm Summary
+The effective capacity of path `p` is:
 
 ```text
-for each sampled IO event:
-    update per-QP/per-path latency, status, and FSM classifier state
-
-when epoch fires:
-    for each path:
-        aggregate active QPs by worst FSM state and non-healthy fault_type
-        map state/fault_type to health_q16 and eligibility
-
-    for each path:
-        capacity[p] = base_iops[p] * health_q16[p]
-        capacity[p] = 0 if quarantined, probe floor if probe-only
-
-    active_tenants = tenants where weight > 0 and demand > 0
-    sort active tenants by demand / weight
-    satisfy tenants whose demand is below weighted fair share
-    split remaining capacity across saturated tenants by weight
-
-    for each tenant and path:
-        tenant_path_rate[t][p] = tenant_rate[t] * capacity[p] / sum(capacity)
-        zero quarantined paths
-        apply probe floor on probe paths
-
-    publish rates with stable epoch protocol
-
-on every host submit:
-    if epoch stale:
-        use M4 static fallback
-    refresh token bucket using host TSC and tenant_path_rate[t][p]
-    if tokens >= IO cost:
-        consume tokens and admit
-    else:
-        return EAGAIN and let SPDK queued_req retry
+e_p = K_p h_p
 ```
 
+The feasible namespace budget is:
+
+```text
+B = min(C, sum over p of e_p)
+```
+
+A demand-aware weighted progressive fill allocates `B`. It satisfies tenants
+whose demand is below their weighted fair share, removes them from the active
+set, and divides the remaining budget among saturated tenants by weight. The
+result obeys:
+
+```text
+0 <= r_t <= d_t
+sum over t of r_t <= B
+```
+
+For paths with nonzero effective capacity, SAPS splits each tenant rate in
+proportion to `e_p`:
+
+```text
+x_t,p = r_t e_p / (sum over q of e_q)
+```
+
+The probe allowance is taken from the admitted rate, so recovery traffic cannot
+increase the namespace budget.
+
+## Publication and enforcement
+
+The DPA publishes the rate matrix and its associated health state with a
+sequence and commit sequence. The host accepts a matrix only when both values
+match. This prevents a submission thread from reading a partially written
+epoch.
+
+The SPDK selector samples paths in proportion to the committed row for the
+current tenant. Per-path token buckets enforce the same row. Selection and
+admission therefore consume one decision instead of maintaining independent
+views of capacity.
+
+## Safety properties
+
+The current implementation checks the following properties at each validated
+run:
+
+1. Total tenant allocation does not exceed the smaller of the service envelope
+   and effective path capacity.
+2. Tenant allocation does not exceed observed demand.
+3. Saturated tenants receive weighted max-min service.
+4. Paths with zero bulk capacity receive at most the configured probe allowance.
+5. A committed matrix is consumed only after complete publication.
+6. Every configured path capacity is explicit. A missing `K_p` is rejected
+   rather than replaced with the namespace envelope.
+
+## Controlled comparison modes
+
+The implementation exposes three allocation modes for experiments. They share
+the estimator, demand tracking, weighted progressive fill, and selector.
+
+- `continuous` uses graded health in both the feasible budget and path split.
+- `fixed` keeps admission at the nominal namespace envelope while using
+  observed health for path placement.
+- `binary` maps any non-healthy path to zero bulk capacity.
+
+The signal-isolation campaign also selects completion semantics, queue depth, or
+request completion time as the health source while keeping the allocator fixed.
+Reachability is represented by a controller configuration that leaves every
+reachable path healthy.

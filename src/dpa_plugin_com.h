@@ -22,7 +22,7 @@
 
 #include <stdint.h>
 
-#define DPA_PLUGIN_RING_LOG2  13             /* 2^13 = 8192 slots × 64B = 512 KiB */
+#define DPA_PLUGIN_RING_LOG2  16             /* 2^16 = 65536 slots × 64B = 4 MiB */
 #define DPA_PLUGIN_RING_SIZE  (1u << DPA_PLUGIN_RING_LOG2)
 #define DPA_PLUGIN_RING_MASK  (DPA_PLUGIN_RING_SIZE - 1u)
 
@@ -36,10 +36,11 @@
 /* E1 CUSUM window size. K=32 integer samples per conn. */
 #define DPA_PLUGIN_WINDOW_K   32u
 
-/* S3 SAPS-single: max paths per bdev channel. Paper single-client experiment
- * uses 2 paths, but sized to 4 to leave headroom. Must be power-of-2. */
-#define DPA_PLUGIN_PATH_LOG2  2
-#define DPA_PLUGIN_PATH_MAX   (1u << DPA_PLUGIN_PATH_LOG2)  /* 4 */
+/* Maximum logical paths per bdev channel.  The shared-namespace scale
+ * campaign exercises up to eight listeners, so every path-indexed plane uses
+ * the same power-of-two dimension. */
+#define DPA_PLUGIN_PATH_LOG2  3
+#define DPA_PLUGIN_PATH_MAX   (1u << DPA_PLUGIN_PATH_LOG2)  /* 8 */
 #define DPA_PLUGIN_PATH_MASK  (DPA_PLUGIN_PATH_MAX - 1u)
 
 /* M2 streaming PCA: per-client PC vector count。對齊 spike N_CLIENTS=16,
@@ -81,16 +82,15 @@
  * path max,不另起 dimension。Tenant/path 編號 alias 既有 M3 / per_qp_path 體系。
  */
 #define SAPSQ_TENANT_MAX  M3_TENANT_MAX        /* 16, alias M3_TENANT_MAX */
-#define SAPSQ_PATH_MAX    DPA_PLUGIN_PATH_MAX  /* 4,  alias DPA_PLUGIN_PATH_MAX */
+#define SAPSQ_PATH_MAX    DPA_PLUGIN_PATH_MAX  /* 8,  alias DPA_PLUGIN_PATH_MAX */
 
 /* SAPS-Q M-series unified scheduler dimension macros.
  * SAPSQ_MAX_TENANTS = 16 (matches SAPSQ_TENANT_MAX; kept as explicit named constant
  *   for the new 2D schema fields per specs/research-architecture-consolidated-20260522.md §5.1).
- * SAPSQ_MAX_PATHS = 8: future-expansion headroom beyond current 3-path testbed.
- *   Existing fields (sapsq_tenant_path_rate_q32 etc.) use SAPSQ_PATH_MAX=4 and are
- *   NOT resized here — only new §5.1 fields use SAPSQ_MAX_PATHS=8. */
+ * SAPSQ_MAX_PATHS aliases the canonical path dimension so classifier,
+ * allocation, enforcement, and telemetry cannot silently diverge. */
 #define SAPSQ_MAX_TENANTS 16
-#define SAPSQ_MAX_PATHS   8
+#define SAPSQ_MAX_PATHS   DPA_PLUGIN_PATH_MAX
 
 /* Health factor in Q16.16 (1.0 = 65536 = HEALTHY full capacity).
  * Mapping from D-classifier (redesign §4.2):
@@ -110,6 +110,27 @@
 #define SAPSQ_ELIG_QUARANTINE  0u
 #define SAPSQ_ELIG_PROBE       1u
 #define SAPSQ_ELIG_NORMAL      2u
+
+/* Runtime-selectable path-health source for controlled signal isolation.
+ * Every source feeds the same HCAA allocator and committed-budget selector.
+ * REQUEST_RTT uses request completion time only. It is not an independent
+ * network probe. */
+enum sapsq_health_source {
+	SAPSQ_HEALTH_SOURCE_COMPLETION = 0,
+	SAPSQ_HEALTH_SOURCE_QUEUE_DEPTH = 1,
+	SAPSQ_HEALTH_SOURCE_REQUEST_RTT = 2,
+};
+
+/* Runtime-selectable coupling policy for controlled HCAA comparisons.
+ * Every mode uses the same estimator and weighted progressive fill. FIXED
+ * keeps admission at the namespace envelope but still uses observed health
+ * for path placement. BINARY excludes any path whose health is below one.
+ * CONTINUOUS uses graded health for both admission and placement. */
+enum sapsq_health_coupling_mode {
+	SAPSQ_HEALTH_COUPLING_CONTINUOUS = 0,
+	SAPSQ_HEALTH_COUPLING_FIXED = 1,
+	SAPSQ_HEALTH_COUPLING_BINARY = 2,
+};
 
 #define DPA_PLUGIN_OPC_CLASS_READ   0u
 #define DPA_PLUGIN_OPC_CLASS_WRITE  1u
@@ -188,19 +209,17 @@ struct dpa_plugin_notify_entry {
 
 /* Cacheline-separated indices.
  *
- * E-4 MPSC note: producer_idx is the multi-producer head. With a single
- * producer (standalone/coordinator) it is plain-store + release-fence. With
- * multiple producers (coordinator + tenants sharing the memfd), every
- * producer uses __atomic_fetch_add(&producer_idx, n, __ATOMIC_ACQ_REL) to
- * reserve n slots, writes its entries, then the ACQ_REL on the RMW acts as
- * the publish fence. The field is 8-byte aligned and sits in its own 64B
- * cacheline (pad0 ensures consumer_idx lives in a separate line, preventing
- * false-sharing between producers and the DPA consumer). The entries[] array
- * is 64B-aligned per-entry (see struct dpa_plugin_notify_entry), so MPSC
- * slot writes never collide on the same cacheline once the slot is reserved.
+ * producer_lock serializes the short batch publication critical section used
+ * by coordinator and tenant processes. producer_idx is the published head,
+ * not a reservation counter. A producer writes and flushes its slots before
+ * advancing producer_idx, so the DPA never consumes a reserved but unwritten
+ * slot. The lock and each index occupy separate cache lines.
  */
 struct dpa_plugin_shared {
 	struct dpa_plugin_notify_entry entries[DPA_PLUGIN_RING_SIZE];
+
+	volatile _Atomic uint32_t producer_lock __attribute__((aligned(64)));
+	uint8_t pad_producer_lock[64 - sizeof(uint32_t)];
 
 	volatile _Atomic uint64_t producer_idx __attribute__((aligned(64)));
 	uint8_t pad0[64 - sizeof(uint64_t)];
@@ -221,6 +240,22 @@ struct dpa_plugin_shared {
 	 * kept as a debug aid. */
 	volatile uint64_t dpa_stopped;
 	uint8_t pad4[64 - sizeof(uint64_t)];
+
+	/* Host-producer integrity telemetry.  Every producer updates max lag
+	 * after reserving a batch and increments overrun_count if the reservation
+	 * would place more than one ring of unconsumed entries in flight.  These
+	 * counters are monotonic for the lifetime of the shared ring and let an
+	 * experiment reject a run even if an overrun occurred between snapshots.
+	 */
+	volatile _Atomic uint64_t ring_overrun_count;
+	volatile _Atomic uint64_t ring_max_lag;
+	uint8_t pad_ring_integrity[64 - 2 * sizeof(uint64_t)];
+
+	/* End-to-end tenant-attribution counters. Host producers increment the
+	 * first array after stamping a sampled submit. The DPA increments the
+	 * second array after reading that submit from the ring. */
+	volatile _Atomic uint64_t host_submit_published[SAPSQ_MAX_TENANTS];
+	volatile uint64_t dpa_submit_consumed_by_tenant[SAPSQ_MAX_TENANTS];
 
 	/* E3 admission control — DPA writes, host reads.
 	 * 0 = throttle this qp, nonzero = admit.
@@ -277,7 +312,7 @@ struct dpa_plugin_shared {
 	 * Values: see enum dpa_saps_action (0=TERMINAL, 1=RETRY_SAME,
 	 *         2=FAILOVER, 3=NOT_ERROR, 0xFF=unset / fall-through).
 	 *
-	 * Size: 1024 * 4 * 1B = 4 KiB. */
+	 * Size: 1024 * 8 * 1B = 8 KiB. */
 	volatile uint8_t per_qp_path_retry_verdict[DPA_PLUGIN_CONN_MAX][DPA_PLUGIN_PATH_MAX];
 
 	/* v2 SAPS path state table — DPA writes FSM state for monitoring,
@@ -286,7 +321,7 @@ struct dpa_plugin_shared {
 	 * Values: see enum dpa_saps_state (0=HEALTHY, 1=DEGRADING,
 	 *         2=EXCLUDED, 3=RECOVERING).
 	 *
-	 * Size: 1024 * 4 * 2B = 8 KiB. */
+	 * Size: 1024 * 8 * 2B = 16 KiB. */
 	volatile uint16_t per_qp_path_state[DPA_PLUGIN_CONN_MAX][DPA_PLUGIN_PATH_MAX];
 
 	/* Slice 19 — DPA writes classifier fault_type for host-side
@@ -337,7 +372,7 @@ struct dpa_plugin_shared {
 	 * because the question is "why doesn't path B reach EXCLUDED" — answered by
 	 * state dwell distribution + dominant fault_type.
 	 *
-	 * Layout: [DPA_PLUGIN_PATH_MAX=4][buckets]. Path index matches existing
+	 * Layout: [DPA_PLUGIN_PATH_MAX=8][buckets]. Path index matches existing
 	 * per_qp_path_* arrays. Host reads via mmap (no RPC needed).
 	 *
 	 * State buckets: 0=HEALTHY 1=DEGRADING 2=EXCLUDED 3=RECOVERING
@@ -598,29 +633,28 @@ struct dpa_plugin_shared {
 	volatile uint32_t sapsq_tenant_demand_q32[SAPSQ_TENANT_MAX];    /* 64 B — host-set or estimated demand in Q32 IOPS-equivalent */
 
 	/* Per-path configuration (host writer, DPA reader) — base capacity + probe budget */
-	volatile uint32_t sapsq_path_base_iops_q32[SAPSQ_PATH_MAX];   /*  16 B — base IOPS in Q32 IO/tsc (host init) */
-	volatile uint32_t sapsq_probe_rate_q32[SAPSQ_PATH_MAX];       /*  16 B — probe budget on quarantined paths */
-	uint8_t pad_sapsq_path_cfg[64 - 32];
+	volatile uint32_t sapsq_path_base_iops_q32[SAPSQ_PATH_MAX];   /*  32 B — base IOPS in Q32 IO/tsc (host init) */
+	volatile uint32_t sapsq_probe_rate_q32[SAPSQ_PATH_MAX];       /*  32 B — probe budget on quarantined paths */
 
 	/* Per-path DPA-computed state (DPA writer, host reader) */
-	volatile uint32_t sapsq_path_health_q16[SAPSQ_PATH_MAX];      /*  16 B — health_factor Q16.16 */
-	volatile uint8_t  sapsq_path_eligibility[SAPSQ_PATH_MAX];     /*   4 B — SAPSQ_ELIG_* */
-	uint8_t pad_sapsq_path_state[64 - 20];
+	volatile uint32_t sapsq_path_health_q16[SAPSQ_PATH_MAX];      /*  32 B — health_factor Q16.16 */
+	volatile uint8_t  sapsq_path_eligibility[SAPSQ_PATH_MAX];     /*   8 B — SAPSQ_ELIG_* */
+	uint8_t pad_sapsq_path_state[64 - SAPSQ_PATH_MAX * 5];
 
 	/* Per-(tenant, path) allocated rate (DPA writer, host reader).
 	 * Q32 IO/tsc compatible with M4 m4_tenant_refresh_per_tsc_q32 format.
-	 * Size: 16 × 4 × 4 B = 256 B (4 cachelines). */
+	 * Size: 16 × 8 × 4 B = 512 B (8 cachelines). */
 	volatile uint32_t sapsq_tenant_path_rate_q32[SAPSQ_TENANT_MAX][SAPSQ_PATH_MAX];
 
 	/* Per-(tenant, path) host-side token bucket state (host writer).
 	 * Each host process only writes its own row [sapsq_my_tenant_id][*].
 	 * Tokens Q16.16 IO units; refresh on every admission_check using host TSC.
-	 * Size: 16 × 4 × 4 B = 256 B + 16 × 4 × 8 B = 512 B = 768 B. */
+	 * Size: 16 × 8 × 4 B = 512 B + 16 × 8 × 8 B = 1024 B = 1536 B. */
 	volatile uint32_t sapsq_tenant_path_tokens_q16[SAPSQ_TENANT_MAX][SAPSQ_PATH_MAX];
 	volatile uint64_t sapsq_tenant_path_last_refresh_tsc[SAPSQ_TENANT_MAX][SAPSQ_PATH_MAX];
 
 	/* Observability counters (host writer on submit; DPA-side may read for demand est).
-	 * Size: 16 × 4 × 8 B × 3 = 1536 B. */
+	 * Size: 16 × 8 × 8 B × 3 = 3072 B. */
 	volatile uint64_t sapsq_admit_count[SAPSQ_TENANT_MAX][SAPSQ_PATH_MAX];
 	volatile uint64_t sapsq_reject_count[SAPSQ_TENANT_MAX][SAPSQ_PATH_MAX];
 	volatile uint64_t sapsq_probe_count[SAPSQ_TENANT_MAX][SAPSQ_PATH_MAX];
@@ -637,8 +671,7 @@ struct dpa_plugin_shared {
 	 *
 	 * These fields use SAPSQ_MAX_TENANTS=16 / SAPSQ_MAX_PATHS=8 and are the
 	 * canonical 2D budget plane for SAPS-Q slice 1+.  The earlier sapsq_*
-	 * fields above (using SAPSQ_TENANT_MAX × SAPSQ_PATH_MAX=4) remain for
-	 * backward compatibility and reviewer transparency.
+	 * fields above now share the same eight-path dimension.
 	 */
 
 	/* DPA-published budget plane (DPA write, host read) */
@@ -647,10 +680,13 @@ struct dpa_plugin_shared {
 	uint8_t pad_sapsq_m_epoch[64 - 8];
 
 	volatile uint32_t sapsq_tenant_path_rate_budget_q32[SAPSQ_MAX_TENANTS][SAPSQ_MAX_PATHS]; /* IO/s budget Q0.32 per (tenant,path); DPA write, host read */
+	volatile uint32_t sapsq_committed_path_health_factor_q16[SAPSQ_MAX_PATHS];   /* health snapshot used for the committed budget epoch */
+	uint8_t pad_sapsq_m_committed_hf[64 - SAPSQ_MAX_PATHS * 4];
+	volatile uint64_t sapsq_committed_path_effective_capacity_iops[SAPSQ_MAX_PATHS]; /* K_p h_p used for the committed budget epoch */
 	volatile uint8_t  sapsq_path_health[SAPSQ_MAX_PATHS];                       /*   8 B — enum: 0=HEALTHY 1=ONSET 2=PERPETUAL_SLOW 3=BIMODAL_TAIL 4=SPARSE_PATH_ERROR 5=RECOVERING 6=QUARANTINED */
 	uint8_t pad_sapsq_m_health[64 - SAPSQ_MAX_PATHS];
 
-	volatile uint32_t sapsq_path_health_factor_q16[SAPSQ_MAX_PATHS];            /*  32 B — Q16.16 [0,1] scale factor applied to path base capacity */
+	volatile uint32_t sapsq_path_health_factor_q16[SAPSQ_MAX_PATHS];            /*  32 B — Q16.16 [0,1] scale factor applied to path deliverable capacity */
 	uint8_t pad_sapsq_m_hf[64 - SAPSQ_MAX_PATHS * 4];
 
 	/* Host-side enforcement plane (host write, DPA read for observability) */
@@ -667,13 +703,21 @@ struct dpa_plugin_shared {
 	volatile uint32_t sapsq_num_tenants;                                        /*   4 B — runtime tenant count, <= SAPSQ_MAX_TENANTS */
 	volatile uint32_t sapsq_num_paths;                                          /*   4 B — runtime path count, <= SAPSQ_MAX_PATHS */
 	volatile uint32_t sapsq_tenant_weight[SAPSQ_MAX_TENANTS];                  /*  64 B — integer weights (e.g. [3,1,1,1]) */
-	volatile uint64_t sapsq_link_cap_iops;                                      /*   8 B — total link capacity hint (IO/s) */
+	volatile uint64_t sapsq_link_cap_iops;                                      /*   8 B — namespace service envelope C (IO/s) */
 	volatile uint32_t sapsq_epoch_period_us;                                    /*   4 B — DPA scheduler epoch period in microseconds */
 	volatile uint32_t sapsq_probe_rate_budget_q32;                              /*   4 B — min probe budget per path for liveness (Q0.32) */
 	volatile uint64_t sapsq_host_tsc_freq;                                      /*   8 B — host TSC frequency Hz (for rate-to-token math) */
 	volatile uint32_t sapsq_bypass_d_classifier;                               /*   4 B — 0=normal D-driven, 1=bypass (force all paths HEALTHY) */
 	volatile uint32_t sapsq_bypass_saps_fsm;                                   /*   4 B — 1=skip SAPS B7 FSM classify+state (E1 baseline testing) */
-	uint8_t pad_sapsq_m_cfg[64 - (4 + 4 + 8 + 4 + 4 + 8 + 4 + 4)];
+	volatile uint32_t sapsq_bypass_health_coupling;                            /*   4 B — enum sapsq_health_coupling_mode; legacy field name preserves ABI */
+	volatile uint32_t sapsq_health_source;                                      /*   4 B — enum sapsq_health_source */
+	uint8_t pad_sapsq_m_cfg[64 - (4 + 4 + 8 + 4 + 4 + 8 + 4 + 4 + 4 + 4)];
+
+	/* Per-path deliverable capacities K_p. These are physical/path-level
+	 * limits, not equal shares of the namespace envelope. A redundant path
+	 * may therefore have K_p == C, allowing healthy paths to absorb traffic
+	 * from a degraded peer without increasing total namespace admission. */
+	volatile uint64_t sapsq_path_capacity_iops[SAPSQ_MAX_PATHS];                /*  64 B — host-configured K_p (IO/s) */
 
 	/* Option 1 host-side demand signal (Lane U, 2026-05-28).
 	 * Host writes (atomic increment) on every submit attempt;

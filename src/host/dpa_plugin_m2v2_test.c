@@ -57,10 +57,10 @@ static int test_pattern(const char *name,
 			 const uint8_t *expected)
 {
 	int fail = 0;
-	/* Seed conf_q16,reset prev verdict so log prints all transitions。 */
+	/* Seed conf_q16. Keep the published verdict from the preceding pattern,
+	 * matching the persistent shared-memory state used in production. */
 	for (int c = 0; c < 16; c++) {
 		ring->m2_pca_conf_q16[c] = conf[c];
-		ring->per_client_joint_verdict[c] = DPA_M2_VERDICT_UNSET;
 	}
 
 	uint64_t t0 = now_us();
@@ -96,6 +96,11 @@ int main(void)
 	memset(ring, 0, sizeof(*ring));
 	ring->saps_m2_enabled  = 1;
 	ring->m2_v2_classifier = 1;
+
+	/* Production initialization seeds the classifier's previous-verdict state
+	 * to UNSET. Prime the standalone test through the same warmup path before
+	 * presenting the first completed confidence vector. */
+	host_m2_classifier_tick(ring);
 
 	int total_fail = 0;
 

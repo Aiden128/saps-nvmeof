@@ -1,107 +1,67 @@
-# SAPS-Q Environment Variables Reference
+# Runtime configuration
 
-Source of truth: `dpa-smart-initiator/flexio_build/samples/dpa_plugin/host/dpa_plugin.c`
-lines ~1518-1723 (SAPS-Q init block).
+The current controller is enabled with the `SAPSQ_*` variables below.
+Identifiers keep the historical `sapsq` prefix for compatibility with
+experiment manifests.
 
-All Q-format conversions performed by `scripts/run_sapsq.py` (`weights_to_q16`,
-`iops_to_q32`); host plugin reads CSV strings as-is and stores into the shared
-ring.
+## Required controller settings
 
-## Variable Table
+| Variable | Meaning |
+| --- | --- |
+| `SAPSQ_ENABLED` | Set to `1` to enable the current SAPS scheduler. |
+| `SAPSQ_MY_TENANT_ID` | Zero-based tenant row used by the current process. |
+| `SAPSQ_NUM_TENANTS` | Number of active tenant rows. The implementation supports up to 16. |
+| `SAPSQ_NUM_PATHS` | Number of logical paths. The implementation supports up to 8. |
+| `SAPSQ_LINK_CAP_IOPS` | Namespace service envelope `C`, in IOPS. |
+| `SAPSQ_PATH_CAP_IOPS` | Comma-separated provisioned path capacities `K_p`, in IOPS. Exactly one positive value is required per path. |
+| `SAPSQ_WEIGHTS` | Comma-separated positive tenant weights. Unspecified weights default to one. |
 
-| Name | Format | Default | Example (4-tenant 3-path testbed) | Mode |
-|------|--------|---------|-----------------------------------|------|
-| `SAPS_Q_ENABLED` | `0` / `1` | `0` (gate off) | `1` | sapsq |
-| `SAPS_Q_MY_TENANT_ID` | uint `[0, 16)` | `0` | `0`/`1`/`2`/`3` per-proc | sapsq |
-| `SAPS_Q_EPOCH_INTERVAL_EVENTS` | uint events | `1024` | `1024` (~10us @100K IOPS/path) | sapsq |
-| `SAPS_Q_EPOCH_STALE_US` | uint microseconds | `1000` | `1000` (host fallback if no fresh epoch in 1ms) | sapsq |
-| `SAPS_Q_WEIGHTS` | CSV of uint Q16.16 | `"65536,21845,21845,21845"` (= 3:1:1:1) | `"32768,10923,10923,10923"` | sapsq |
-| `SAPS_Q_DEMAND_Q32` | CSV of uint Q32 IO/tsc | (required) | `"429496,429496,429496,429496"` (= 100K IOPS @ 1GHz TSC) | sapsq |
-| `SAPS_Q_PATH_BASE_IOPS_Q32` | CSV of uint Q32 IO/tsc | (required) | `"858993,858993,858993"` (= 200K IOPS @ 1GHz TSC, 3 paths) | sapsq |
-| `SAPS_Q_PROBE_RATE_Q32` | CSV of uint Q32 IO/tsc | empty (no probe) | `"429,429,429"` (= 100 IOPS @ 1GHz TSC) | sapsq |
-| `DPA_PLUGIN_PATH_MAP_PORTS` | CSV of `port:path_id` | unset (use formula) | `"4430:0,4431:0,4432:0,4433:0,4440:1,4441:1,4442:1,4443:1,4450:2,4451:2,4452:2,4453:2"` | sapsq |
+A controller configuration without `SAPSQ_PATH_CAP_IOPS` is rejected. The
+implementation does not infer a missing path capacity from the namespace
+envelope.
 
-## Q-Format Conversion Formulas
+## Timing and sampling
 
-```
-weight_q16 = round(w_i * 65536 / sum(w))     # Q16.16, sum == 65536
-rate_q32   = round(iops_per_sec / tsc_hz * 2^32)
-```
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `SAPSQ_EPOCH_PERIOD_US` | `1000` | Allocation epoch in microseconds. |
+| `SAPSQ_PROBE_RATE_IOPS` | `1000` | Per-tenant recovery-probe allowance before it is divided among probe paths. |
+| `SAPSQ_HOST_TSC_FREQ` | architectural counter | Host counter frequency used for rate conversion. |
+| `DPA_PLUGIN_SAMPLE_RATE` | `1` | Observe one completion in every N completions. |
 
-BF3 host aarch64 `cntfrq_el0 = 1_000_000_000` (1 GHz nominal). If running on a
-host where `cat /sys/devices/system/clocksource/clocksource0/current_clocksource`
-shows a different cntvct frequency, pass `--tsc-hz` to `run_sapsq.py`.
+The shared-ring size is a compile-time setting controlled by
+`DPA_PLUGIN_RING_LOG2` in `src/dpa_plugin_com.h`.
 
-Example (orchestrator does this for you):
+## Path identity and process coordination
 
-```python
-weights = [3, 1, 1, 1]
-weights_q16 = [int(round(w / 6 * 65536)) for w in weights]
-# → [32768, 10923, 10923, 10923]
+| Variable | Meaning |
+| --- | --- |
+| `DPA_PLUGIN_ROLE` | `coordinator` creates the shared ring. `tenant` attaches to it. |
+| `DPA_PLUGIN_SOCK` | Unix-domain socket used to exchange the shared-memory descriptor. |
+| `DPA_PLUGIN_PATH_MAP_PORTS` | Explicit transport-port to logical-path mapping, such as `4430:0,4431:1,4432:2`. |
+| `DPA_PLUGIN_NOTIFY` | Enables submission and completion publication. |
+| `DPA_PLUGIN_ADMISSION` | Enables host-side consumption of committed rate budgets. |
 
-iops = 200_000
-tsc_hz = 1_000_000_000
-rate_q32 = int(round(iops / tsc_hz * (1 << 32)))
-# → 858993
-```
+## Controlled experiment modes
 
-## Mode Matrix
+These variables define comparison arms. They are not separate production
+controllers.
 
-| Mode | `SAPS_Q_ENABLED` | `SAPS_M4_ENABLED` | `SAPS_M5_DRR_ENABLED` | `DPA_PLUGIN_DISABLE_INIT` |
-|------|------------------|---------------------|------------------------|----------------------------|
-| `stock` | `0` | `0` | `0` | `1` (skip plugin entirely) |
-| `m4_static` | `0` | `1` | `0` | `0` (need plugin for M4) |
-| `sapsq` | `1` | `0` | `0` | `0` |
-| `spdk_bdev_qos` | `0` | `0` | `0` | `1` (node1 enforces, host doesn't init plugin) |
-| `sapsq` (single-tenant D-series, E5b) | `1` | `0` | `0` | `0` |
+| Variable | Values | Meaning |
+| --- | --- | --- |
+| `SAPSQ_HEALTH_COUPLING_MODE` | `continuous`, `fixed`, `binary` | Selects graded HCAA, nominal-envelope allocation, or binary exclusion. |
+| `SAPSQ_HEALTH_SOURCE` | `completion`, `queue_depth`, `request_rtt` | Selects the observation consumed by the same allocator. |
+| `SAPSQ_BYPASS_D_CLASSIFIER` | `0` or `1` | Forces all paths healthy when set to one. |
+| `SAPSQ_BYPASS_SAPS_FSM` | `0` or `1` | Disables the completion-driven state machine when set to one. |
+| `SAPSQ_BYPASS_HEALTH_COUPLING` | `0` or `1` | Legacy alias for fixed-envelope comparison when no explicit mode is set. |
+| `SAPSQ_BYPASS_BUDGET_SELECTION` | `0` or `1` | Bypasses the committed-budget path selector for an ablation. |
 
-### E5b Single-Tenant D-Series Mode Notes
+The paper campaigns build complete environment profiles in their driver code.
+Use those profiles when reproducing a figure instead of setting individual
+switches by hand.
 
-E5b 使用 D-series single-NQN topology（ports 4430/4431/4432 共用同一 NQN），tenant 數 = 1，`SAPS_Q_MY_TENANT_ID=0`。與 4-tenant multi-NQN mode 的差異：
+## Legacy variables
 
-- `SAPS_Q_WEIGHTS="65536"` — 單一租戶，全額 Q16.16 (65536 = 1.0)
-- `DPA_PLUGIN_PATH_MAP_PORTS=4430:0,4431:1,4432:2` — **必須顯式設定**。D-series 三個 port 在同一 NQN 上，預設公式 `(port-4430)/10` 會把 4431→0、4432→0，三個 port 全 map 到 path_id=0，SAPS-Q per-path budget 失效。
-- E5b 的 inline bdevperf 不走 `run_sapsq.py`，故這個 env var 由 driver script 直接注入（見 `scripts/sapsq_e5b_dseries_hero_with_sapsq.sh` 第 111 行）。
-
-## How CSV Lengths Map to Tenant/Path Indices
-
-- Weight / demand CSV: index `i` → tenant `i` (0..3 for 4-tenant testbed)
-- Path-base / probe CSV: index `p` → path `p` (0..2 for 3-path testbed)
-
-Plugin pads missing entries with `0` (which means "tenant inactive" or "path
-unavailable"). The orchestrator validates the CSV lengths in `build_config()`
-before launch.
-
-## Init Failure Modes
-
-`host/dpa_plugin.c` writes `dpa_plugin: SAPS-Q disabled — <reason>` to stderr and
-falls through to M4 substrate when:
-
-- `SAPS_Q_MY_TENANT_ID` >= `SAPSQ_TENANT_MAX` (16)
-- `SAPS_Q_WEIGHTS` sums to 0
-- `SAPS_Q_DEMAND_Q32` missing or empty
-- `SAPS_Q_PATH_BASE_IOPS_Q32` missing or empty
-
-The orchestrator does NOT detect these from stderr (greylist parsing brittle);
-inspect `tenant_*/bdevperf.log` if `sapsq_total_epochs_consumed_delta` stays at
-`0` across the run.
-
-## Counter Observability
-
-These are written by the host fast path (`dpa_plugin.c` line ~2057-2083) and
-read by `scripts/sapsq_dump`:
-
-| Counter | Field | Type | Reset |
-|---------|-------|------|-------|
-| Admits | `sapsq_admit_count[t][p]` | `uint64_t` (atomic relaxed add) | Init only |
-| Rejects | `sapsq_reject_count[t][p]` | `uint64_t` | Init only |
-| Probe submits | `sapsq_probe_count[t][p]` | `uint64_t` | Init only |
-| Stale fallbacks | `sapsq_stale_epoch_fallback` | `uint64_t` (global) | Init only |
-| Epochs consumed | `sapsq_total_epochs_consumed` | `uint64_t` (global) | Init only |
-| Path health | `sapsq_path_health_q16[p]` | `uint32_t` (DPA writer) | DPA-driven |
-| Path eligibility | `sapsq_path_eligibility[p]` | `uint8_t` (DPA writer) | DPA-driven |
-
-Each tenant proc has its own ring (memfd in `standalone` role), so admit/reject
-counters from `tenant_i`'s ring only reflect `tenant_i`'s submissions.
-Cross-tenant aggregation in `aggregate_sapsq.py` sums across the per-proc
-snapshots.
+The source retains older `SAPS_Q_*` and `SAPS_M*` variables because earlier
+prototype modes share the same library. They are not used by the current paper
+campaigns unless a comparison driver sets them explicitly.

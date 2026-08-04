@@ -1,112 +1,135 @@
-# SAPS — Semantics-Aware Path Steering for Disaggregated NVMe-over-Fabrics
+# SAPS: Semantics-Aware Path Steering for Disaggregated NVMe over Fabrics
 
-Reference implementation and evaluation harness for **SAPS**, a completion-aware
-NVMe-oF path-steering layer that runs on a SmartNIC datapath accelerator (NVIDIA
-BlueField-3 DPA). SAPS folds each fabric path's measured health into a single
-weighted max-min capacity allocation, so that steering away from a failing path
-and dividing capacity by tenant weight become one computation rather than two
-competing mechanisms.
+This repository contains the prototype and experiment drivers used by the SAPS
+paper. SAPS treats path repair and tenant scheduling as one allocation problem.
+It derives a graded path-health signal from NVMe completion behavior, converts
+that signal into effective path capacity, and allocates the feasible service
+budget with weighted max-min fairness.
 
-> Companion artifact to the paper *"SAPS: Semantics-Aware Path Steering for
-> Disaggregated NVMe-over-Fabrics on the SmartNIC Datapath"* (Future Generation
-> Computer Systems). See the paper for the design rationale and the measured results.
+The prototype runs the estimator and allocator on NVIDIA BlueField-3 DPA cores.
+The host-side SPDK path reads committed decisions and applies them while
+submitting I/O.
+
+## Design in one equation
+
+For path `p`, SAPS combines provisioned path capacity `K_p` with estimated
+health `h_p`:
+
+```text
+e_p = K_p h_p
+B   = min(C, sum_p e_p)
+```
+
+Here, `C` is the configured service envelope and `B` is the service budget
+that can be promised under the current path state. A demand-aware weighted
+progressive fill divides `B` among active tenants. Each tenant's rate is then
+split across paths in proportion to `e_p`. Excluded paths receive only the
+bounded probe traffic needed to test recovery.
 
 ## Repository layout
 
-- `src/` — the SAPS plugin
-  - `dev/dpa_plugin_dev.c` — DPA signal plane: NEWMA change-point test, Frugal-2U
-    tail estimator, per-path FSM, and the health-coupled weighted max-min allocator
-  - `host/dpa_plugin.c` — host shim: FlexIO RPC, notify ring, and the two-word
-    admission / steer fast path (`*_smoke.c` / `*_test.c` are sanity and accuracy tests)
-  - `dpa_plugin.h`, `dpa_plugin_com.h`, `host_saps.h` — public API and shared structs
-  - `meson.build` — build orchestration (`dpacc` for the DPA app; host static library)
-- `integration/spdk-patches/` — patches that hook the SAPS submit/complete callbacks
-  into SPDK's `nvme_rdma.c` fast path, plus bdevperf init and fault-injection
-- `evaluation/` — `run_experiments.py` (orchestrator), `aggregate_results.py`
-  (result aggregation), `sapsq_dump.c` (shared-memory counter reader),
-  `sapsq_allocator_ref.py` (reference allocator for cross-verification), and the
-  per-experiment scripts in `experiments/`
-- `docs/` — design spec, implementation notes, testbed runbook, env-var reference
+- `src/` contains the DPA program, the host library, and shared data structures.
+- `integration/spdk-patches/` records the SPDK hook points used by the prototype.
+- `scripts/` contains the campaign drivers used by the current paper results.
+- `experiments/3path_targets/` contains the target setup scripts required by
+  those campaigns.
+- `evaluation/` retains the original experiment wrappers and standalone
+  reference tools.
+- `docs/` describes the control loop, implementation boundary, runtime
+  configuration, and testbed procedure.
 
-## Prerequisites
-
-**Hardware**
-- NVIDIA BlueField-3 DPU (DPA / FlexIO capable)
-- A two-machine RDMA (RoCEv2) testbed: one NVMe-oF target and one initiator carrying
-  the BlueField-3, reachable over multiple fabric paths
-
-**Software**
-- NVIDIA DOCA SDK (FlexIO + `dpacc`), 2025.10 or newer
-- SPDK (recent `main`) with the patches in `integration/spdk-patches/` applied
-- Meson ≥ 0.60 + Ninja, a C11 compiler, Python 3.8+
-- Time synchronization (chrony / NTP) between the two machines
+The `sapsq` prefix remains in internal symbols and filenames for compatibility
+with recorded experiment manifests. It refers to the SAPS controller described
+in the paper.
 
 ## Build
 
-```bash
-# 1. DPA app + host library
-cd src && meson setup build && ninja -C build      # DPA app object + libdpa_plugin.a
-
-# 2. Patch and rebuild SPDK
-cd "$SPDK_ROOT"
-for p in /path/to/saps-code/integration/spdk-patches/*.patch; do patch -p1 < "$p"; done
-./configure && make -j"$(nproc)"
-
-# 3. Counter reader
-cc -O2 -I /path/to/saps-code/src/host -o sapsq_dump /path/to/saps-code/evaluation/sapsq_dump.c
-```
-
-See `docs/TESTBED_RUNBOOK.md` for the full procedure and `docs/ENV_VARS.md` for the
-runtime toggles (e.g. `DPA_PLUGIN_ENABLED`, the host-resident ablation, the QoS plane).
-
-## Reproduce
-
-Each script under `evaluation/experiments/` drives one experiment through
-`run_experiments.py` (SSH orchestration of target + initiator, fault injection, result
-aggregation). For example:
+The DPA application requires NVIDIA DOCA FlexIO and the SPDK integration used by
+the testbed.
 
 ```bash
-cd evaluation
-bash experiments/sapsq_e3_path_degradation.sh   # media-error / fail-slow steering
-bash experiments/sapsq_e1_static_fairness.sh    # weighted multi-tenant fairness
-bash experiments/sapsq_e5_overhead.sh           # healthy-path overhead
+cd src
+meson setup build
+ninja -C build
 ```
 
-Results land as CSV/JSON; `aggregate_results.py` produces the per-experiment tables.
-The exact headline numbers, repetition counts (N), and statistics are reported in the paper.
+Build the shared-memory inspection tool separately:
 
-> The experiment scripts and runbook contain **testbed-specific host paths and addresses**.
-> See `REVIEW_BEFORE_PUBLISH.md` and adjust them to your environment.
+```bash
+cc -O2 -std=gnu11 -Isrc -o scripts/sapsq_dump scripts/sapsq_dump.c
+```
 
-## Design summary
+The SPDK integration files document the submit, completion, path-selection, and
+initialization hooks. They target the SPDK revision used by the prototype and
+should be reviewed before applying them to another revision.
 
-The DPA reads NVMe completion semantics (the `sct/sc` status codes and per-completion
-timing) off a notify ring, maintains per-path detectors and a finite-state machine, and
-reduces each path to a scalar **health** factor. The allocator scales each path's
-capacity by its health and runs one weighted max-min fill: quarantine is the
-`health → 0` limit of the same allocation, and the single-tenant case is its `T = 1`
-degenerate form. The host fast path only reads the precomputed decision. See
-`docs/DESIGN.md` and `docs/IMPLEMENTATION.md`.
+## Paper campaigns
+
+The current paper is backed by five campaign drivers:
+
+- `scripts/run_signal_isolation_campaign.py` compares completion semantics,
+  reachability, queue depth, and request completion time under matched faults.
+- `scripts/run_hcaa_scale_campaign.py` compares continuous health-coupled
+  allocation with nominal weighted max-min allocation as path and tenant counts
+  increase.
+- `scripts/run_summit_v2_campaign.py` runs the path-delay and coupling
+  comparison.
+- `scripts/run_generality_campaign.py` repeats one controller configuration
+  across I/O sizes and read-write mixes.
+- `scripts/run_overhead_qd_campaign.py` measures healthy-path throughput cost
+  across queue depths.
+
+These drivers are the source copies whose hashes are recorded by the experiment
+manifests. They retain the testbed's absolute paths, interface names, RPC
+sockets, and SSH host aliases. Edit those settings for another deployment.
+Raw measurements are intentionally not stored in this repository.
+
+## Local checks
+
+The reference allocator exercises the capacity boundary and weighted
+progressive fill without hardware:
+
+```bash
+python3 evaluation/sapsq_allocator_ref.py
+```
+
+The campaign logic has hardware-independent tests:
+
+```bash
+python3 -m unittest \
+  scripts/test_run_signal_isolation_campaign.py \
+  scripts/test_run_summit_v2_campaign.py \
+  scripts/test_run_overhead_qd_campaign.py
+```
+
+Syntax-check all published Python sources with:
+
+```bash
+python3 -m compileall -q evaluation scripts
+```
+
+## Requirements
+
+- NVIDIA BlueField-3 with DPA and FlexIO support
+- NVIDIA DOCA SDK 2025.10 or newer
+- SPDK built with the SAPS integration
+- An NVMe-oF RDMA initiator and target with multiple paths
+- Python 3.10 or newer
+- NumPy for the severity campaign
+
+See `docs/TESTBED_RUNBOOK.md` for the order of operations.
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](LICENSE).
+Apache License 2.0. See `LICENSE`.
 
 ## Citation
 
-If you use SAPS in your work, please cite:
+If you use this artifact, cite:
 
 > Yong-Xuan Huang, Ming-Hung Chen, I-Hsin Chung, and Jerry Chou.
-> "SAPS: Semantics-Aware Path Steering for Disaggregated NVMe-over-Fabrics on the
-> SmartNIC Datapath." *Future Generation Computer Systems* (under review), 2026.
+> "SAPS: Semantics-Aware Path Steering for Disaggregated NVMe-over-Fabrics on
+> the SmartNIC Datapath." Future Generation Computer Systems, under review,
+> 2026.
 
-A machine-readable citation is provided in [`CITATION.cff`](CITATION.cff); the BibTeX
-entry will be updated once the paper is published.
-
-## Acknowledgements
-
-The authors thank the IBM Thomas J. Watson Research Center for providing the
-computational resources used in this work, and Wei-Fang Sun (NVIDIA AI Technology
-Center, NVAITC) for technical support and insightful critiques. This work was supported
-by the National Science and Technology Council (NSTC) under Grant
-No. 114-2221-E-007-059-MY3.
+A machine-readable record is available in `CITATION.cff`.

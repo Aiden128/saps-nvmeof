@@ -44,6 +44,7 @@
 #include <linux/memfd.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <time.h>
 
 #include <infiniband/verbs.h>
 #include <libflexio/flexio_ver.h>
@@ -72,8 +73,8 @@ extern flexio_func_t dpa_plugin_rpc;
 #define DPA_LEASE_CONTINUE 0xc0ff33c0ff33ull
 #define DPA_PLUGIN_FAULT_PROPORTIONAL_THROTTLE 9u
 
-/* Option A (Lane X): aarch64 cache clean to PoC after writing shared-ring
- * fields that the DPA reads via FlexIO window (PCIe DMA path).
+/* aarch64 cache clean to PoC after writing notify-ring fields that the DPA
+ * reads via the FlexIO window (PCIe DMA path).
  *
  * Root cause: __atomic_fetch_add leaves the updated cache line in CPU L1/L2.
  * The NIC DMA engine (used by flexio_dev_window_ptr_acquire) reads physical
@@ -87,24 +88,9 @@ extern flexio_func_t dpa_plugin_rpc;
  * barrier that serialises the clean before any subsequent memory operations,
  * ensuring the NIC cannot observe the old value after this macro returns.
  *
- * Scope: applied to sapsq_host_submit_count[] writes (Lane X fix) AND to
- * notify-ring entries[] + producer_idx writes (BB fix).  The previous comment
- * claiming entries[]/producer_idx were "already covered" was incorrect: ARM64
- * __atomic_fetch_add (STLXR) only enforces CPU-to-CPU store ordering; it does
- * NOT guarantee the cache line is written back to DRAM.  DPA reads via the
- * FlexIO window (PCIe), which goes to DRAM, not the ARM CPU cache.  Without
- * dc cvac the DPA sees stale zeros, events_seen stays 0, demand_ewma=0,
- * rate_budget_q32=0 — the entire SAPS-Q publish path silently fails. */
+ * ARM64 atomics enforce CPU-to-CPU ordering but do not guarantee that dirty
+ * cache lines have reached DRAM before the DPA reads them. */
 #ifdef __aarch64__
-#define SAPSQ_HOST_SUBMIT_COUNT_FLUSH(ptr)                              \
-	do {                                                            \
-		__asm__ __volatile__(                                   \
-			"dc cvac, %0\n\t"                               \
-			"dsb ish"                                       \
-			:                                               \
-			: "r" (ptr)                                     \
-			: "memory");                                    \
-	} while (0)
 /* BB fix: flush a single cache line to DRAM without an ordering barrier.
  * Use DPA_RING_FLUSH_CACHELINE() in a loop over entries[], then call
  * DPA_RING_FLUSH_BARRIER() once after all lines are cleaned.  This amortises
@@ -116,8 +102,6 @@ extern flexio_func_t dpa_plugin_rpc;
 #else
 /* Non-aarch64 (e.g., x86_64 developer builds): no explicit flush needed;
  * x86 has a strongly-ordered memory model and typically coherent DMA. */
-#define SAPSQ_HOST_SUBMIT_COUNT_FLUSH(ptr) \
-	__asm__ __volatile__("" ::: "memory")
 #define DPA_RING_FLUSH_CACHELINE(ptr) \
 	__asm__ __volatile__("" ::: "memory")
 #define DPA_RING_FLUSH_BARRIER() \
@@ -151,6 +135,12 @@ static uint32_t g_n_conn_mask = 0; /* N-1 when N is power of two; else 0 */
 static volatile uint32_t g_sample_rate = 1;
 static uint64_t g_sample_skipped;
 static uint64_t g_sample_force_pub_errors;
+static uint64_t g_sample_submit_seq;
+/* One bit per path/command slot records the submission sampling decision so
+ * the matching completion follows the same decision. Sampling fixed command
+ * IDs biases processes whose active CID range contains no multiple of the
+ * configured rate. */
+static uint64_t g_sampled_cmd[DPA_PLUGIN_PATH_MAX][UINT16_MAX / 64u + 1u];
 
 /* E4 coordinator/tenant: process-local SAPS-Q tenant id.
  * Each bdevperf tenant process reads SAPSQ_MY_TENANT_ID from env and stores it
@@ -160,6 +150,16 @@ static uint64_t g_sample_force_pub_errors;
  * row.
  * 0xFFFFFFFFu = not set (dormant, fall through to ring->sapsq_my_tenant_id). */
 static uint32_t g_sapsq_local_tenant_id = 0xFFFFFFFFu;
+
+/* Offered-demand publication for HCAA.
+ *
+ * The DPA cannot infer offered demand from admitted submissions. Once a tenant
+ * is throttled, admitted submissions fall, which would reduce its next budget
+ * and create a self-reinforcing starvation loop. Count admission attempts
+ * before enforcement and publish them in batches. The cache clean makes the
+ * counter visible to the DPA window without placing a barrier on every I/O. */
+#define SAPSQ_OFFERED_FLUSH_BATCH 128u
+static __thread uint64_t g_sapsq_offered_pending;
 
 /* E3 admission-control state (host side). */
 enum dpa_plugin_force_mode {
@@ -171,14 +171,6 @@ enum dpa_plugin_force_mode {
 #define DPA_FORCE_TOGGLE_PERIOD 1000u  /* gate state flips every 1000 admission checks */
 static volatile int g_force_mode = DPA_FORCE_NONE;
 static volatile int g_admission_enabled = 0;  /* 0 = no gating (Mech-D clean) */
-
-/* F-6 (2026-05-31): batch the sapsq_host_submit_count DRAM flush instead of a
- * per-IO `dsb ish`.  The DPA scheduler_tick reads this counter only ~every 10ms,
- * so flushing every 64 admits caps staleness at ~32us @ 2M IOPS — far inside the
- * tick period — while removing a ~30-100 cycle full barrier from every ADMIT
- * (audit estimated ~6.5% host cycles at D0 2M-IOPS all-ADMIT). */
-#define SAPSQ_SUBMIT_FLUSH_PERIOD 64u
-static __thread uint32_t g_submit_flush_ctr;
 
 /* E-4 role selection. */
 enum dpa_plugin_role {
@@ -259,9 +251,9 @@ static volatile int g_retry_overlay_enabled;
 /* Multi-reactor fix (2026-06-10): the completion hook runs on every SPDK
  * reactor thread.  The staging buffer + its fill count MUST be per-thread,
  * otherwise concurrent reactors tear records into the same buffer and
- * double-flush.  Each thread stages its own batch and flushes it into the
- * shared ring via the atomic producer_idx fetch_add (already MPSC-safe).
- * Follows the existing __thread pattern (g_submit_flush_ctr ~:181). */
+ * double-flush. Each thread stages its own batch and publishes it through the
+ * process-shared producer lock. Each reactor therefore owns an independent
+ * staging buffer while the shared head remains a write-complete boundary. */
 static __thread struct dpa_plugin_notify_entry
 	g_batch_buf[DPA_PLUGIN_BATCH_SIZE] __attribute__((aligned(64)));
 static __thread uint32_t g_batch_count;
@@ -278,13 +270,18 @@ static void *sampler_fn(void *arg)
 	uint64_t prev_pushed = 0, prev_consumed = 0;
 	uint64_t tick = 0;
 	fprintf(c->sampler_file,
-		"t_s,pushed_total,consumed_total,pushed_delta,consumed_delta,ring_lag,"
-		"dem0,dem1,dem2,dem3,bud0,bud1,bud2,bud3,hf0,hf1,hf2,ftB\n");
+		"t_s,unix_s,pushed_total,consumed_total,pushed_delta,consumed_delta,ring_lag,"
+		"dem0,dem1,dem2,dem3,bud0,bud1,bud2,bud3,"
+		"bud_t0p0,bud_t0p1,bud_t0p2,"
+		"hf0,hf1,hf2,chf0,chf1,chf2,eff0,eff1,eff2,ftB\n");
 	fflush(c->sampler_file);
 	while (!c->sampler_stop) {
 		struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
 		nanosleep(&ts, NULL);
 		tick++;
+		struct timespec wall;
+		clock_gettime(CLOCK_REALTIME, &wall);
+		double unix_s = (double)wall.tv_sec + (double)wall.tv_nsec / 1.0e9;
 		__atomic_thread_fence(__ATOMIC_ACQUIRE);
 		uint64_t pushed = g_batch_events_pushed;
 		uint64_t consumed = c->ring ? c->ring->dpa_consumed : 0;
@@ -298,13 +295,22 @@ static void *sampler_fn(void *arg)
 		 * scheduler-level work-conserving redistribution). */
 		/* health_factor (Q16.16→float) for paths 0/1/2 and fault_type for path B(=1) */
 		float hf[3] = {0.0f, 0.0f, 0.0f};
+		float chf[3] = {0.0f, 0.0f, 0.0f};
+		uint32_t eff[3] = {0};
 		uint16_t ftB = 0;
 		if (c->ring) {
-			for (int p = 0; p < 3; p++)
+			for (int p = 0; p < 3; p++) {
 				hf[p] = (float)c->ring->sapsq_path_health_factor_q16[p] / 65536.0f;
+				chf[p] =
+					(float)c->ring->sapsq_committed_path_health_factor_q16[p] /
+					65536.0f;
+				eff[p] =
+					c->ring->sapsq_committed_path_effective_capacity_iops[p];
+			}
 			ftB = c->ring->per_qp_path_fault_type[0][1]; /* coordinator QP=0, path B=1 */
 		}
 		uint32_t dem[4] = {0}, bud[4] = {0};
+		uint32_t bud_t0p[3] = {0};
 		if (c->ring) {
 			uint64_t tf = c->ring->sapsq_host_tsc_freq
 				    ? c->ring->sapsq_host_tsc_freq : 1000000000ull;
@@ -313,9 +319,20 @@ static void *sampler_fn(void *arg)
 				uint64_t q = c->ring->sapsq_tenant_path_rate_budget_q32[t][0];
 				bud[t] = (uint32_t)((q * tf) >> 32);
 			}
+			for (int p = 0; p < 3; p++) {
+				uint64_t q =
+					c->ring->sapsq_tenant_path_rate_budget_q32[0][p];
+				bud_t0p[p] = (uint32_t)((q * tf) >> 32);
+			}
 		}
-		fprintf(c->sampler_file, "%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%u\n",
+		fprintf(c->sampler_file,
+			"%lu,%.6f,%lu,%lu,%lu,%lu,%lu,"
+			"%u,%u,%u,%u,%u,%u,%u,%u,"
+			"%u,%u,%u,"
+			"%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+			"%u,%u,%u,%u\n",
 			(unsigned long)tick,
+			unix_s,
 			(unsigned long)pushed,
 			(unsigned long)consumed,
 			(unsigned long)(pushed - prev_pushed),
@@ -323,7 +340,10 @@ static void *sampler_fn(void *arg)
 			(unsigned long)lag,
 			dem[0], dem[1], dem[2], dem[3],
 			bud[0], bud[1], bud[2], bud[3],
+			bud_t0p[0], bud_t0p[1], bud_t0p[2],
 			(double)hf[0], (double)hf[1], (double)hf[2],
+			(double)chf[0], (double)chf[1], (double)chf[2],
+			eff[0], eff[1], eff[2],
 			(unsigned)ftB);
 		fflush(c->sampler_file);
 		prev_pushed = pushed;
@@ -959,9 +979,12 @@ static int uds_client_get_memfd(const char *path, uint64_t *out_size)
 	return memfd;
 }
 
-/* Allocate the ring in a memfd region (coordinator only).
- * Replaces posix_memalign for coordinator role so the same physical pages
- * can be mmap'd by tenant processes via SCM_RIGHTS fd passing. */
+/* Allocate the ring in a memfd region (coordinator and standalone roles).
+ * Replaces posix_memalign so the ring lives on shareable/mappable pages.
+ * For coordinator the same physical pages are mmap'd by tenant processes via
+ * SCM_RIGHTS fd passing; for standalone the memfd lets the out-of-band
+ * sapsq_dump helper map the ring via /proc/<pid>/fd (anonymous heap would be
+ * unreadable to the dumper). Ring layout/size are unchanged either way. */
 static int alloc_ring_memfd(struct dpa_plugin_ctx *c, size_t ring_alloc_size)
 {
 	c->ring_memfd = dpa_memfd_create("dpa_plugin_ring", MFD_CLOEXEC);
@@ -1094,12 +1117,18 @@ static void sapsq_init_shared(struct dpa_plugin_shared *com)
 	for (uint32_t p = 0; p < SAPSQ_MAX_PATHS; p++) {
 		com->sapsq_path_health[p]            = 0; /* HEALTHY */
 		com->sapsq_path_health_factor_q16[p] = SAPSQ_HEALTH_HEALTHY_Q16;
+		com->sapsq_path_capacity_iops[p]     = 0;
 	}
 
 	/* D classifier bypass gate (host init writes, DPA reads in sapsq_compute_health) */
 	com->sapsq_bypass_d_classifier = 0;
 	/* SAPS B7 FSM bypass gate (host init writes, DPA reads in saps_update complete path) */
 	com->sapsq_bypass_saps_fsm = 0;
+	/* Continuous HCAA is the production coupling policy. */
+	com->sapsq_bypass_health_coupling =
+		SAPSQ_HEALTH_COUPLING_CONTINUOUS;
+	/* Completion semantics are the production default. */
+	com->sapsq_health_source = SAPSQ_HEALTH_SOURCE_COMPLETION;
 
 	/* Per-tenant config (host init) */
 	for (uint32_t t = 0; t < SAPSQ_MAX_TENANTS; t++) {
@@ -1135,7 +1164,7 @@ static void sapsq_init_shared(struct dpa_plugin_shared *com)
  *
  * sapsq_read_stable_epoch():   讀取 epoch_seq/commit_seq 雙-seq stable-epoch protocol
  * sapsq_refresh_and_consume(): Q16.16 token bucket refresh + consume for (t,p)
- * sapsq_admission_check_2d():  2D enforcement 主入口 (try hint → cross-path → probe)
+ * sapsq_admission_check_2d():  enforce the budget of the selected path
  * sapsq_m_init():              讀 SAPSQ_* env,初始化 M-series 欄位
  *
  * 命名前綴全用 sapsq_ 避免與既有 m4_/m5_ 衝突。
@@ -1156,6 +1185,22 @@ static inline uint64_t sapsq_host_now_tsc(void)
 	uint64_t v;
 	__asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
 	return v;
+}
+
+static inline void sapsq_publish_offered_attempt(
+	struct dpa_plugin_shared *com, uint32_t tenant_id)
+{
+	g_sapsq_offered_pending++;
+	if (g_sapsq_offered_pending < SAPSQ_OFFERED_FLUSH_BATCH)
+		return;
+
+	__atomic_fetch_add(
+		&com->sapsq_host_submit_count[tenant_id],
+		g_sapsq_offered_pending,
+		__ATOMIC_RELAXED);
+	DPA_RING_FLUSH_CACHELINE(&com->sapsq_host_submit_count[tenant_id]);
+	DPA_RING_FLUSH_BARRIER();
+	g_sapsq_offered_pending = 0;
 }
 
 /* sapsq_read_stable_epoch: 讀取 sapsq_epoch_seq / sapsq_epoch_commit_seq 雙-seq
@@ -1266,6 +1311,56 @@ static inline bool sapsq_read_stable_row(
 	return false;
 }
 
+int dpa_plugin_read_sapsq_budget_row(uint32_t *budget_q32,
+				     uint32_t max_paths)
+{
+	uint32_t tenant_id;
+	uint32_t num_paths;
+	uint32_t epoch;
+	uint32_t row[SAPSQ_MAX_PATHS];
+	bool any_budget = false;
+
+	if (budget_q32 == NULL || max_paths == 0 || g_ctx.ring == NULL ||
+	    !g_ctx.ring->sapsq_enabled) {
+		return 0;
+	}
+
+	tenant_id = (g_sapsq_local_tenant_id < SAPSQ_MAX_TENANTS)
+		    ? g_sapsq_local_tenant_id
+		    : g_ctx.ring->sapsq_my_tenant_id;
+	if (tenant_id >= SAPSQ_MAX_TENANTS ||
+	    !sapsq_read_stable_row(g_ctx.ring, tenant_id, &epoch, row) ||
+	    epoch == 0) {
+		return 0;
+	}
+
+	num_paths = g_ctx.ring->sapsq_num_paths;
+	if (num_paths == 0 || num_paths > SAPSQ_MAX_PATHS) {
+		num_paths = SAPSQ_MAX_PATHS;
+	}
+	if (num_paths > max_paths) {
+		num_paths = max_paths;
+	}
+
+	for (uint32_t p = 0; p < num_paths; p++) {
+		budget_q32[p] = row[p];
+		any_budget |= row[p] != 0;
+	}
+
+	return any_budget ? (int)num_paths : 0;
+}
+
+uint32_t dpa_plugin_read_sapsq_probe_rate_q32(void)
+{
+	if (g_ctx.ring == NULL || !g_ctx.ring->sapsq_enabled) {
+		return 0;
+	}
+
+	return __atomic_load_n(
+		&g_ctx.ring->sapsq_probe_rate_budget_q32,
+		__ATOMIC_ACQUIRE);
+}
+
 /* sapsq_refresh_and_consume: Q16.16 token bucket refresh + consume for (t,p)。
  *
  * 公式:
@@ -1354,28 +1449,30 @@ static inline int sapsq_refresh_and_consume_m(
 	return -EAGAIN;  /* REJECT */
 }
 
-/* sapsq_admission_check_2d: 2D 主入口 (stable-epoch → hint path → cross-path
- * steer → probe budget → fallback)。
+/* sapsq_admission_check_2d: enforce the committed budget for the path selected
+ * by SPDK before the RDMA submission hook runs.
  *
- * 參數:
- *   com          — shared struct (g_ctx.ring)
- *   tenant_id    — this process's tenant id (sapsq_my_tenant_id)
- *   path_id_hint — preferred path (from qpair mapping or qp_id hash)
- *   path_id_out  — 成功時寫入實際使用的 path_id
+ * The admission hook receives an already-selected qpair. It can delay that
+ * submission, but it cannot redirect it to another qpair. Token accounting
+ * must therefore use the qpair's physical path. Consuming another path's token
+ * here would make the budget table disagree with the path that carries the IO.
  *
  * 返回:
- *   0                          — ADMIT,path_id_out 有效
+ *   0                          — ADMIT
  *   SAPSQ_ADMIT_STALE_FALLBACK — epoch 尚未就緒(cold-start),caller 走 M4
- *   -EAGAIN                    — 全路徑 token 耗盡,caller 回 -EAGAIN to SPDK
+ *   -EAGAIN                    — selected path has no token, retry through SPDK
  */
 static int sapsq_admission_check_2d(
 	struct dpa_plugin_shared *com,
 	uint32_t tenant_id,
-	uint8_t path_id_hint,
-	uint8_t *path_id_out)
+	uint8_t selected_path)
 {
 	if (!com->sapsq_enabled)
 		return SAPSQ_ADMIT_STALE_FALLBACK;
+
+	/* Demand is measured before enforcement so a reduced budget cannot make
+	 * an active tenant appear idle to the next HCAA epoch. */
+	sapsq_publish_offered_attempt(com, tenant_id);
 
 	/* Step 1: stable-epoch read。讀失敗(DPA 持續 in-flight)→ fallback。
 	 * epoch_commit_seq == 0 代表 DPA scheduler 尚未執行過任何 tick → cold-start。 */
@@ -1421,63 +1518,23 @@ static int sapsq_admission_check_2d(
 		}
 	}
 
-	uint64_t now_tsc = sapsq_host_now_tsc();
 	uint32_t num_paths = com->sapsq_num_paths;
 	if (num_paths == 0 || num_paths > SAPSQ_MAX_PATHS)
 		num_paths = SAPSQ_MAX_PATHS;
+	if (selected_path >= num_paths)
+		selected_path = 0;
 
-	/* Step 2: try hint path first.  epoch != 0 is guaranteed here
-	 * (epoch==0 case already returned above). */
-	{
-		uint8_t hint = path_id_hint;
-		if (hint >= num_paths)
-			hint = 0;
-
-		int r = sapsq_refresh_and_consume_m(com, tenant_id, hint,
-						    row[hint], now_tsc);
-		if (r == 0) {
-			*path_id_out = hint;
-			return 0;
-		}
-
-		/* Step 3: cross-path steer — 找其他 token 充足的 path。
-		 * 跳過 QUARANTINED path(health == 6),probe path 由 step 4 處理。 */
-		for (uint32_t p = 0; p < num_paths; p++) {
-			if (p == (uint32_t)hint)
-				continue;
-			if (com->sapsq_path_health[p] >= SAPSQ_HEALTH_QUARANTINED_VAL)
-				continue;  /* skip quarantined path */
-			r = sapsq_refresh_and_consume_m(com, tenant_id, p,
-							row[p], now_tsc);
-			if (r == 0) {
-				*path_id_out = (uint8_t)p;
-				return 0;
-			}
-		}
+	uint64_t now_tsc = sapsq_host_now_tsc();
+	int rc = sapsq_refresh_and_consume_m(
+		com, tenant_id, selected_path, row[selected_path], now_tsc);
+	if (rc == 0 &&
+	    (com->sapsq_path_health[selected_path] >= SAPSQ_HEALTH_QUARANTINED_VAL ||
+	     row[selected_path] <= com->sapsq_probe_rate_budget_q32)) {
+		__atomic_fetch_add(
+			&com->sapsq_probe_count[tenant_id][selected_path],
+			1ull, __ATOMIC_RELAXED);
 	}
-
-	/* Step 4: probe budget — cold-start (epoch==0) 以及正常路徑 token 耗盡時。
-	 * 允許 sapsq_probe_rate_budget_q32 worth IOs 通過任意 path(包含 quarantined),
-	 * 避免 cold-start deadlock:DPA scheduler_tick 需要觀察到 IO demand 才能算出
-	 * 非零 rate_budget;probe 允許足夠 IO 通過讓 DPA 看到 demand,系統快速收斂。 */
-	uint32_t probe_rate = com->sapsq_probe_rate_budget_q32;
-	if (probe_rate > 0) {
-		uint8_t hint0 = (path_id_hint < num_paths) ? path_id_hint : 0;
-		for (uint32_t p = 0; p < num_paths; p++) {
-			uint32_t pp = (hint0 + p) % num_paths;
-			int r = sapsq_refresh_and_consume_m(com, tenant_id, pp,
-							    probe_rate, now_tsc);
-			if (r == 0) {
-				*path_id_out = (uint8_t)pp;
-				__atomic_fetch_add(
-					&com->sapsq_probe_count[tenant_id][pp],
-					1ull, __ATOMIC_RELAXED);
-				return 0;
-			}
-		}
-	}
-
-	return -EAGAIN;
+	return rc;
 }
 
 /* sapsq_m_init: 初始化 SAPS-Q M-series 欄位,讀 SAPSQ_* env vars。
@@ -1538,6 +1595,42 @@ static void sapsq_m_init(struct dpa_plugin_shared *com)
 	if (link_cap == 0)
 		link_cap = 200000ULL;
 
+	/* Per-path deliverable capacities K_p, formatted as "900000,900000,900000".
+	 * K_p is independent of the namespace service envelope C and must be
+	 * provisioned explicitly. A silent K_p=C fallback makes the allocator's
+	 * capacity boundary depend on an undocumented assumption and can invalidate
+	 * health-coupling experiments. */
+	uint64_t path_capacity[SAPSQ_MAX_PATHS] = {0};
+	const char *pc_env = getenv("SAPSQ_PATH_CAP_IOPS");
+	if (!(pc_env && pc_env[0])) {
+		fprintf(stderr,
+			"dpa_plugin: SAPSQ_M disabled — SAPSQ_PATH_CAP_IOPS is required\n");
+		return;
+	}
+	char pc_buf[256];
+	strncpy(pc_buf, pc_env, sizeof(pc_buf) - 1);
+	pc_buf[sizeof(pc_buf) - 1] = '\0';
+	char *pc_tok = strtok(pc_buf, ",");
+	uint32_t pc_count = 0;
+	while (pc_tok && pc_count < num_p) {
+		uint64_t cap = strtoull(pc_tok, NULL, 10);
+		if (cap == 0) {
+			fprintf(stderr,
+				"dpa_plugin: SAPSQ_M disabled — invalid K_%u=%s\n",
+				pc_count, pc_tok);
+			return;
+		}
+		path_capacity[pc_count++] = cap;
+		pc_tok = strtok(NULL, ",");
+	}
+	if (pc_count != num_p || pc_tok != NULL) {
+		fprintf(stderr,
+			"dpa_plugin: SAPSQ_M disabled — SAPSQ_PATH_CAP_IOPS "
+			"requires exactly %u positive values\n",
+			num_p);
+		return;
+	}
+
 	/* epoch_period_us */
 	const char *ep_env = getenv("SAPSQ_EPOCH_PERIOD_US");
 	uint32_t epoch_period_us = (ep_env && ep_env[0])
@@ -1545,7 +1638,8 @@ static void sapsq_m_init(struct dpa_plugin_shared *com)
 	if (epoch_period_us == 0)
 		epoch_period_us = 1000u;
 
-	/* weights — 整數,格式 "3,1,1,1"。不做 Q16.16 轉換,直接存整數(DPA 讀)。 */
+	/* Integer tenant weights. The experiment harness may choose a skewed
+	 * distribution, but an unspecified deployment defaults to equal shares. */
 	const char *wt_env = getenv("SAPSQ_WEIGHTS");
 	uint32_t weights[SAPSQ_MAX_TENANTS] = {0};
 	int n_w = 0;
@@ -1560,10 +1654,9 @@ static void sapsq_m_init(struct dpa_plugin_shared *com)
 		}
 	}
 	if (n_w == 0) {
-		/* default 3:1:1:1 (直接整數,與 DPA scheduler tick 讀法一致) */
-		weights[0] = 3u; weights[1] = 1u;
-		weights[2] = 1u; weights[3] = 1u;
-		n_w = 4;
+		for (uint32_t t = 0; t < num_t; t++)
+			weights[t] = 1u;
+		n_w = (int)num_t;
 	}
 
 	/* probe_rate_budget_q32 — 從 IOPS 換算 Q0.32 IO/tsc。
@@ -1603,6 +1696,9 @@ static void sapsq_m_init(struct dpa_plugin_shared *com)
 	com->sapsq_epoch_period_us  = epoch_period_us;
 	com->sapsq_host_tsc_freq    = tsc_freq;
 	com->sapsq_probe_rate_budget_q32 = probe_rate_q32;
+	for (uint32_t p = 0; p < SAPSQ_MAX_PATHS; p++)
+		com->sapsq_path_capacity_iops[p] =
+			(p < num_p) ? path_capacity[p] : 0;
 
 	/* TSC fallback for sapsq_run_epoch: 10ms window ensures the DPA epoch
 	 * scheduler fires even when throttling prevents event accumulation.
@@ -1627,8 +1723,8 @@ static void sapsq_m_init(struct dpa_plugin_shared *com)
 	 * path (sapsq_scheduler_tick / sapsq_tenant_path_rate_budget_q32) is
 	 * functioning correctly.
 	 *
-	 * base_iops = link_cap / num_p (equal-share per path, same as
-	 * sapsq_compute_path_capacity on the DPA M-series side).
+	 * The legacy diagnostic allocator retains an equal-share base because its
+	 * Q32 budget plane is not used by the M-series enforcement path.
 	 * weight_q16 = same integer as the M-series weight (scheduler reads
 	 * them directly as unitless integers in both paths). */
 	{
@@ -1656,6 +1752,54 @@ static void sapsq_m_init(struct dpa_plugin_shared *com)
 	 * Set to 0 (or unset) to re-enable SAPS B7 for E3/path-degradation tests. */
 	const char *bypsm_env = getenv("SAPSQ_BYPASS_SAPS_FSM");
 	com->sapsq_bypass_saps_fsm = (bypsm_env && bypsm_env[0] == '1') ? 1u : 0u;
+
+	/* Controlled coupling comparison. Fixed mode retains health-informed
+	 * path placement but does not reduce the namespace admission envelope.
+	 * The legacy bypass variable maps to that mode. */
+	const char *coupling_env = getenv("SAPSQ_HEALTH_COUPLING_MODE");
+	const char *byphc_env = getenv("SAPSQ_BYPASS_HEALTH_COUPLING");
+	if (coupling_env == NULL || coupling_env[0] == '\0' ||
+	    strcmp(coupling_env, "continuous") == 0) {
+		com->sapsq_bypass_health_coupling =
+			SAPSQ_HEALTH_COUPLING_CONTINUOUS;
+	} else if (strcmp(coupling_env, "fixed") == 0) {
+		com->sapsq_bypass_health_coupling =
+			SAPSQ_HEALTH_COUPLING_FIXED;
+	} else if (strcmp(coupling_env, "binary") == 0) {
+		com->sapsq_bypass_health_coupling =
+			SAPSQ_HEALTH_COUPLING_BINARY;
+	} else {
+		fprintf(stderr,
+			"dpa_plugin: unknown SAPSQ_HEALTH_COUPLING_MODE=%s; "
+			"using continuous\n",
+			coupling_env);
+		com->sapsq_bypass_health_coupling =
+			SAPSQ_HEALTH_COUPLING_CONTINUOUS;
+	}
+	if ((coupling_env == NULL || coupling_env[0] == '\0') &&
+	    byphc_env && byphc_env[0] == '1') {
+		com->sapsq_bypass_health_coupling =
+			SAPSQ_HEALTH_COUPLING_FIXED;
+	}
+
+	/* Controlled signal-isolation mode. All modes retain the same HCAA
+	 * allocator and committed-budget selector. REQUEST_RTT denotes the
+	 * observed request completion time, not a separate network probe. */
+	const char *health_source_env = getenv("SAPSQ_HEALTH_SOURCE");
+	if (health_source_env == NULL ||
+	    strcmp(health_source_env, "completion") == 0) {
+		com->sapsq_health_source = SAPSQ_HEALTH_SOURCE_COMPLETION;
+	} else if (strcmp(health_source_env, "queue_depth") == 0) {
+		com->sapsq_health_source = SAPSQ_HEALTH_SOURCE_QUEUE_DEPTH;
+	} else if (strcmp(health_source_env, "request_rtt") == 0) {
+		com->sapsq_health_source = SAPSQ_HEALTH_SOURCE_REQUEST_RTT;
+	} else {
+		fprintf(stderr,
+			"dpa_plugin: unknown SAPSQ_HEALTH_SOURCE=%s; "
+			"using completion\n",
+			health_source_env);
+		com->sapsq_health_source = SAPSQ_HEALTH_SOURCE_COMPLETION;
+	}
 
 	/* Pre-seed probe token buckets so the first sapsq_refresh_and_consume_m
 	 * call during cold-start (last_tsc==0 → dt_tsc=0 → refill=0) can still
@@ -1700,15 +1844,22 @@ static void sapsq_m_init(struct dpa_plugin_shared *com)
 
 	fprintf(stderr,
 		"dpa_plugin: SAPSQ_M enabled tid=%u num_t=%u num_p=%u "
-		"link_cap=%lu epoch_us=%u tsc_freq=%lu probe_q32=%u bypass_d=%u bypass_fsm=%u\n",
+		"link_cap=%lu epoch_us=%u tsc_freq=%lu probe_q32=%u "
+		"bypass_d=%u bypass_fsm=%u health_coupling_mode=%u "
+		"health_source=%u\n",
 		my_tid, num_t, num_p,
 		(unsigned long)link_cap, epoch_period_us,
 		(unsigned long)tsc_freq, probe_rate_q32,
 		com->sapsq_bypass_d_classifier,
-		com->sapsq_bypass_saps_fsm);
+		com->sapsq_bypass_saps_fsm,
+		com->sapsq_bypass_health_coupling,
+		com->sapsq_health_source);
 	for (int i = 0; i < n_w; i++)
 		fprintf(stderr, "dpa_plugin: SAPSQ_M tenant %d weight=%u\n",
 			i, weights[i]);
+	for (uint32_t p = 0; p < num_p; p++)
+		fprintf(stderr, "dpa_plugin: SAPSQ_M path %u K_p=%lu IOPS\n",
+			p, (unsigned long)path_capacity[p]);
 }
 
 int dpa_plugin_init(void)
@@ -1741,6 +1892,17 @@ int dpa_plugin_init(void)
 	const char *sock_path = (sock_env && sock_env[0]) ? sock_env
 							   : DPA_PLUGIN_SOCK_DEFAULT;
 
+	/* Parse sampling before the tenant attach fast path. Every producer shares
+	 * the same completion ring, so coordinator and tenant processes must apply
+	 * the same publication rate. */
+	const char *sample_env = getenv("DPA_PLUGIN_SAMPLE_RATE");
+	if (sample_env && sample_env[0]) {
+		int sr = atoi(sample_env);
+		g_sample_rate = (sr > 0) ? (uint32_t)sr : 1;
+	} else {
+		g_sample_rate = 1;
+	}
+
 	/* Tenant: connect to coordinator, receive memfd, attach. No FlexIO. */
 	if (g_ctx.role == DPA_ROLE_TENANT) {
 		uint64_t rsize = 0;
@@ -1772,8 +1934,9 @@ int dpa_plugin_init(void)
 		/* M3 v4 snapshot dumper:tenant proc 也要 dump 自己的 ledger,
 		 * 給 host control daemon 做 closed-loop feedback。 */
 		m3_snapshot_maybe_start(&g_ctx);
-		fprintf(stderr, "dpa_plugin: tenant init ok (role=tenant sock=%s)\n",
-			sock_path);
+		fprintf(stderr,
+			"dpa_plugin: tenant init ok (role=tenant sock=%s sample_rate=%u)\n",
+			sock_path, g_sample_rate);
 		return 0;
 	}
 
@@ -1811,15 +1974,6 @@ int dpa_plugin_init(void)
 	/* Slice 1: independent retry-verdict overlay toggle. Default 0. */
 	const char *overlay_env = getenv("DPA_PLUGIN_RETRY_OVERLAY");
 	g_retry_overlay_enabled = (overlay_env && overlay_env[0] == '1') ? 1 : 0;
-
-	/* Slice 11a: sub-sample rate. Default 1 = full publish. */
-	const char *sample_env = getenv("DPA_PLUGIN_SAMPLE_RATE");
-	if (sample_env && sample_env[0]) {
-		int sr = atoi(sample_env);
-		g_sample_rate = (sr > 0) ? (uint32_t)sr : 1;
-	} else {
-		g_sample_rate = 1;
-	}
 
 	fprintf(stderr,
 		"dpa_plugin: init start (dev=%s notify=%d n_conn=%u adm=%d force=%s retry_overlay=%d sample_rate=%u)\n",
@@ -1866,19 +2020,15 @@ int dpa_plugin_init(void)
 	size_t page_sz = (size_t)sysconf(_SC_PAGESIZE);
 	size_t ring_alloc_size = (ring_sz + page_sz - 1) & ~(page_sz - 1);
 
-	if (g_ctx.role == DPA_ROLE_COORDINATOR) {
-		if (alloc_ring_memfd(&g_ctx, ring_alloc_size))
-			goto err;
-	} else {
-		/* Standalone — bit-identical to P0.5 path. */
-		g_ctx.ring_alloc_size = ring_alloc_size;
-		if (posix_memalign((void **)&g_ctx.ring, page_sz,
-				   g_ctx.ring_alloc_size)) {
-			fprintf(stderr, "dpa_plugin: posix_memalign(%zu) failed\n",
-				g_ctx.ring_alloc_size);
-			goto err;
-		}
-	}
+	/* Ring backing is a memfd for both coordinator and standalone (tenant
+	 * returns early above and never reaches here). The former standalone
+	 * path used a posix_memalign heap ring; it now shares the coordinator's
+	 * memfd backing so the out-of-band sapsq_dump helper can map the ring
+	 * via /proc/<pid>/fd. Only the backing store changes (heap ->
+	 * MAP_SHARED memfd); ring layout, size, and allocation semantics are
+	 * unchanged, so the SAPS-Q algorithm is bit-identical to the P0.5 path. */
+	if (alloc_ring_memfd(&g_ctx, ring_alloc_size))
+		goto err;
 	memset(g_ctx.ring, 0, g_ctx.ring_alloc_size);
 	/* E1-fix1 cumulative-credit scheme:
 	 *   per_qp_tokens = monotonic credit issued (DPA writer)
@@ -2731,21 +2881,33 @@ static __attribute__((noinline)) void dpa_plugin_flush_batch(void)
 	if (n == 0)
 		return;
 
-	/* E-4 MPSC: reserve n slots atomically. Returns the slot base (old
-	 * producer_idx). Every producer (single-process standalone OR
-	 * coordinator + N tenants all sharing the memfd-backed ring) uses the
-	 * same path — the fetch_add is a no-contention op when N=1, and a
-	 * cache-line-bouncing atomic when N>1 (measured 50-200 ns on Arm,
-	 * acceptable per R2-verify Option C analysis).
-	 *
-	 * ACQ_REL semantics: ACQUIRE pairs with earlier producer writes to
-	 * entries[] (in principle not needed here since we haven't written
-	 * yet, but cheap); RELEASE ensures our subsequent entry writes become
-	 * visible AFTER we've reserved the slot. We then issue a thread fence
-	 * + a second release-store on the index to publish our payload. */
-	/* Reserve n slots in one atomic RMW. base = old producer_idx. */
-	uint64_t base = __atomic_fetch_add(&g_ctx.ring->producer_idx, n,
-					   __ATOMIC_ACQ_REL);
+	/* The shared index is a publication boundary. Advancing it before the
+	 * entries are written lets the DPA consume holes when several processes
+	 * flush concurrently. Serialize the small batch-copy critical section and
+	 * publish the new head only after every entry cache line reaches memory. */
+	while (__atomic_exchange_n(&g_ctx.ring->producer_lock, 1u,
+				    __ATOMIC_ACQUIRE) != 0u) {
+		__asm__ __volatile__("yield");
+	}
+
+	uint64_t base = __atomic_load_n(&g_ctx.ring->producer_idx,
+					__ATOMIC_RELAXED);
+	uint64_t end = base + n;
+	uint64_t consumer = __atomic_load_n(
+		&g_ctx.ring->consumer_idx, __ATOMIC_ACQUIRE);
+	uint64_t lag = end >= consumer ? end - consumer : 0;
+	uint64_t observed_max = __atomic_load_n(
+		&g_ctx.ring->ring_max_lag, __ATOMIC_RELAXED);
+	while (lag > observed_max &&
+	       !__atomic_compare_exchange_n(
+		       &g_ctx.ring->ring_max_lag, &observed_max, lag, false,
+		       __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+		/* observed_max is refreshed by the failed compare-exchange. */
+	}
+	if (__builtin_expect(lag > DPA_PLUGIN_RING_SIZE, 0)) {
+		__atomic_fetch_add(
+			&g_ctx.ring->ring_overrun_count, 1, __ATOMIC_RELAXED);
+	}
 	uint32_t start = (uint32_t)(base & DPA_PLUGIN_RING_MASK);
 	uint32_t tail_space = DPA_PLUGIN_RING_SIZE - start;
 	if (n <= tail_space) {
@@ -2772,9 +2934,11 @@ static __attribute__((noinline)) void dpa_plugin_flush_batch(void)
 		uint32_t _slot = (uint32_t)((base + _fi) & DPA_PLUGIN_RING_MASK);
 		DPA_RING_FLUSH_CACHELINE(&g_ctx.ring->entries[_slot]);
 	}
+	DPA_RING_FLUSH_BARRIER();
+	__atomic_store_n(&g_ctx.ring->producer_idx, end, __ATOMIC_RELEASE);
 	DPA_RING_FLUSH_CACHELINE(&g_ctx.ring->producer_idx);
 	DPA_RING_FLUSH_BARRIER();
-	__atomic_thread_fence(__ATOMIC_RELEASE);
+	__atomic_store_n(&g_ctx.ring->producer_lock, 0u, __ATOMIC_RELEASE);
 
 	g_batch_count = 0;
 	__atomic_fetch_add(&g_batch_flushes, 1, __ATOMIC_RELAXED);
@@ -2789,14 +2953,34 @@ static inline void dpa_plugin_push(uint16_t cmd_id, uint8_t opcode,
 	if (!g_notify_enabled)
 		return;
 
-	/* Slice 11a sub-sample gate. Skip events when sample_rate > 1 unless this
-	 * is an error completion (sct_sc != 0). Using cmd_id % rate keeps the
-	 * submit/complete pair of the same IO together — both pass or both skip.
-	 * Errors bypass to keep D3 sparse-error classifier accuracy intact. */
+	/* Slice 11a sub-sample gate. Select every Nth submission and remember the
+	 * decision by path/CID so the matching completion follows it. Error
+	 * completions bypass the gate to preserve sparse-error evidence. */
 	if (__builtin_expect(g_sample_rate > 1, 0)) {
+		uint32_t path_slot = (uint32_t)path_id & DPA_PLUGIN_PATH_MASK;
+		uint32_t word = (uint32_t)cmd_id >> 6;
+		uint64_t bit = 1ull << ((uint32_t)cmd_id & 63u);
+		bool selected;
+
+		if (kind == 0) {
+			uint64_t seq = __atomic_fetch_add(&g_sample_submit_seq, 1,
+							 __ATOMIC_RELAXED);
+			selected = (seq % g_sample_rate) == 0;
+			if (selected) {
+				__atomic_fetch_or(&g_sampled_cmd[path_slot][word], bit,
+						  __ATOMIC_RELAXED);
+			} else {
+				__atomic_fetch_and(&g_sampled_cmd[path_slot][word], ~bit,
+						   __ATOMIC_RELAXED);
+			}
+		} else {
+			selected = (__atomic_fetch_and(&g_sampled_cmd[path_slot][word],
+						       ~bit, __ATOMIC_RELAXED) & bit) != 0;
+		}
+
 		if (sct_sc != 0) {
 			g_sample_force_pub_errors++;
-		} else if ((uint32_t)cmd_id % g_sample_rate != 0) {
+		} else if (!selected) {
 			g_sample_skipped++;
 			return;
 		}
@@ -2826,6 +3010,12 @@ static inline void dpa_plugin_push(uint16_t cmd_id, uint8_t opcode,
 		 * replace only the low M3_TENANT_LOG2 bits with the tenant ID. */
 		qp_id = (uint16_t)((qp_id & ~(uint16_t)M3_TENANT_MASK)
 				   | (uint16_t)(g_sapsq_local_tenant_id & M3_TENANT_MASK));
+	}
+	if (kind == 0 && g_ctx.ring) {
+		uint32_t tid = (uint32_t)qp_id & M3_TENANT_MASK;
+		__atomic_fetch_add(
+			&g_ctx.ring->host_submit_published[tid],
+			1ull, __ATOMIC_RELAXED);
 	}
 
 	struct dpa_plugin_notify_entry *e = &g_batch_buf[g_batch_count];
@@ -2999,9 +3189,14 @@ uint16_t dpa_plugin_path_id_from_port(uint16_t port)
 	uint16_t mapped = g_dpa_port_to_path[port];
 	if (mapped != 0xFFFFu)
 		return mapped;
-	/* Default formula: path A = 4430..4439, B = 4440..4449, C = 4450..4459.
-	 * Matches node1 setup_arm1_sapsq_4t3p.sh layout. Out-of-range ports
-	 * clamp to slot 0. */
+	/* Current testbed layouts when no explicit map is supplied:
+	 *   single-NQN: 4430/4431/4432 -> A/B/C
+	 *   multi-tenant: 45xx/46xx/47xx -> A/B/C (low two digits are tenant)
+	 * Keep the older 4430/4440/4450 decade layout as a final fallback. */
+	if (port >= 4500u && port < 4800u)
+		return (uint16_t)((port - 4500u) / 100u);
+	if (port >= 4430u && port < 4430u + DPA_PLUGIN_PATH_MAX)
+		return (uint16_t)(port - 4430u);
 	if (port < 4430)
 		return 0;
 	uint16_t pid = (uint16_t)((port - 4430u) / 10u);
@@ -3185,7 +3380,7 @@ int dpa_plugin_admission_check(struct spdk_nvme_qpair *qpair, uint16_t qp_id,
 		if (my_tid < SAPSQ_TENANT_MAX) {
 			/* Slice 3 (2026-05-27): SAPS-Q M-series 2D enforcement。
 			 * sapsq_epoch_seq/commit_seq 雙-seq stable-epoch read +
-			 * cross-path steer + probe budget。
+			 * selected-path budget enforcement。
 			 *
 			 * 若 sapsq_host_tsc_freq != 0(sapsq_m_init 已跑)且
 			 * epoch_commit_seq > 0(DPA scheduler 已發佈至少一個 epoch),
@@ -3197,31 +3392,20 @@ int dpa_plugin_admission_check(struct spdk_nvme_qpair *qpair, uint16_t qp_id,
 				uint16_t path_hint = dpa_plugin_path_id_of(qpair);
 				if (path_hint >= DPA_PLUGIN_PATH_MAX)
 					path_hint = (uint16_t)(qp_id & DPA_PLUGIN_PATH_MASK);
+				uint32_t num_paths = g_ctx.ring->sapsq_num_paths;
+				if (num_paths == 0 || num_paths > SAPSQ_MAX_PATHS)
+					num_paths = SAPSQ_MAX_PATHS;
+				if (path_hint >= num_paths)
+					path_hint = 0;
 
-				uint8_t path_chosen = (uint8_t)path_hint;
 				int r2d = sapsq_admission_check_2d(
 					g_ctx.ring,
 					my_tid,
-					(uint8_t)path_hint,
-					&path_chosen);
+					(uint8_t)path_hint);
 
 				if (r2d == 0) {
-					/* ADMIT — 2D path succeeded。
-					 * Option 1 (Lane U): increment host-side submit counter so
-					 * DPA scheduler_tick can detect idle tenants without relying
-					 * on DPA-side g_sapsq_submit_count (producer_idx visibility
-					 * broken in coordinator VA / tenant alias VA mismatch). */
-					__atomic_fetch_add(
-						&g_ctx.ring->sapsq_host_submit_count[my_tid],
-						1ull, __ATOMIC_RELAXED);
-					/* Option A (Lane X): flush updated counter to DRAM so DPA
-					 * NIC DMA engine sees it via FlexIO window.  F-6: batched —
-					 * one dsb ish per SAPSQ_SUBMIT_FLUSH_PERIOD admits, not per IO. */
-					if (++g_submit_flush_ctr >= SAPSQ_SUBMIT_FLUSH_PERIOD) {
-						g_submit_flush_ctr = 0;
-						SAPSQ_HOST_SUBMIT_COUNT_FLUSH(
-							&g_ctx.ring->sapsq_host_submit_count[my_tid]);
-					}
+					/* ADMIT. The DPA event path records submitted work and
+					 * updates the demand estimate used by the scheduler. */
 					__atomic_fetch_add(&g_ctx.ring->host_adm_checks, 1, __ATOMIC_RELAXED);
 					return 0;
 				}
@@ -3233,32 +3417,16 @@ int dpa_plugin_admission_check(struct spdk_nvme_qpair *qpair, uint16_t qp_id,
 					 * through to the old sapsq_epoch_commit token-bucket
 					 * path — that path reads sapsq_tenant_path_rate_q32
 					 * (old scheduler field, always 0 in M-series mode)
-					 * and would reject every IO, deadlocking the system.
-					 * Option 1 (Lane U): also count cold-start admits so
-					 * DPA sees demand signal during bootstrap. */
-					__atomic_fetch_add(
-						&g_ctx.ring->sapsq_host_submit_count[my_tid],
-						1ull, __ATOMIC_RELAXED);
-					/* Option A (Lane X): flush counter to DRAM for DPA visibility.
-					 * F-6: batched (one dsb ish per SAPSQ_SUBMIT_FLUSH_PERIOD admits). */
-					if (++g_submit_flush_ctr >= SAPSQ_SUBMIT_FLUSH_PERIOD) {
-						g_submit_flush_ctr = 0;
-						SAPSQ_HOST_SUBMIT_COUNT_FLUSH(
-							&g_ctx.ring->sapsq_host_submit_count[my_tid]);
-					}
+					 * and would reject every IO, deadlocking the system. */
 					__atomic_fetch_add(
 						&g_ctx.ring->sapsq_stale_epoch_fallback,
 						1ull, __ATOMIC_RELAXED);
 					__atomic_fetch_add(&g_ctx.ring->host_adm_checks, 1, __ATOMIC_RELAXED);
 					return 0;  /* ADMIT during M-series cold-start */
 				} else {
-					/* -EAGAIN: all paths exhausted.  Bump reject_count for
-					 * the actually-tried path (path_chosen), matching the
-					 * admit/probe counters which key on the chosen path, not
-					 * the raw hint.  path_chosen is seeded from path_hint and
-					 * updated by sapsq_admission_check_2d via its out-param. */
+					/* -EAGAIN: the selected path has no token. */
 					__atomic_fetch_add(
-						&g_ctx.ring->sapsq_reject_count[my_tid][path_chosen],
+						&g_ctx.ring->sapsq_reject_count[my_tid][path_hint],
 						1ull, __ATOMIC_RELAXED);
 					__atomic_fetch_add(&g_ctx.ring->host_adm_checks, 1, __ATOMIC_RELAXED);
 					__atomic_fetch_add(&g_ctx.ring->host_adm_throttles, 1, __ATOMIC_RELAXED);
@@ -3671,7 +3839,7 @@ uint64_t dpa_plugin_read_producer_idx(void)
  * bdev_nvme_find_io_path). Must be branchless-friendly + noinline-free. */
 /* S3 multipath ctrlr→slot map. See header comment on dpa_plugin_ctrlr_to_path_idx.
  * First-come first-served: first distinct ctrlr pointer gets slot 0, etc.
- * Lock-free via CAS on a small fixed array (DPA_PLUGIN_PATH_MAX=4 entries). */
+ * Lock-free via CAS on a small fixed array (DPA_PLUGIN_PATH_MAX=8 entries). */
 static _Atomic(const void *) g_dpa_ctrlr_slots[DPA_PLUGIN_PATH_MAX];
 
 /* Generation counter for the ctrlr→slot map. Bumped by
@@ -3686,8 +3854,8 @@ static _Atomic uint32_t g_dpa_ctrlr_gen;
  *
  * Slice 9.5 profile shows dpa_plugin_ctrlr_to_path_idx accounts for ~0.29 %
  * cycles + drives downstream icache pressure (linear-scan + atomic acquires
- * per IO submit/complete + 3× per select_io_path Pass 1). With ≤ 4 distinct
- * ctrlr pointers in the BF3 cluster, a 4-entry direct-mapped cache hits ~100 %
+ * per IO submit/complete + 3× per select_io_path Pass 1). With ≤ 8 distinct
+ * ctrlr pointers in the BF3 cluster, an 8-entry direct-mapped cache hits ~100 %
  * after warmup.
  *
  * Threading: SPDK reactors are single-threaded per core, so __thread storage
@@ -3703,8 +3871,7 @@ static _Atomic uint32_t g_dpa_ctrlr_gen;
  * back into pointer-aliasing reuse during a bdevperf run, so this is safe.
  *
  * Sentinel: cache[*].ctrlr == NULL means slot is empty (untouched on warmup
- * or after thread re-entry). Cache size = sizeof(void*)+u16 ≈ 16 B × 4 = 64 B,
- * fits one cache line.
+ * or after thread re-entry). Cache size is bounded by DPA_PLUGIN_PATH_MAX.
  */
 struct dpa_ctrlr_cache_entry {
 	const void *ctrlr;
@@ -3757,7 +3924,7 @@ uint16_t dpa_plugin_ctrlr_to_path_idx(const void *ctrlr)
 		g_dpa_ctrlr_cache_gen = gen;
 	}
 
-	/* Fast path: per-thread cache. 4-way scan, no atomics. */
+	/* Fast path: per-thread cache scan, no atomics. */
 	for (uint16_t i = 0; i < DPA_PLUGIN_PATH_MAX; i++) {
 		if (__builtin_expect(g_dpa_ctrlr_cache[i].ctrlr == ctrlr, 1)) {
 			return g_dpa_ctrlr_cache[i].path_idx;
@@ -3790,8 +3957,7 @@ uint16_t dpa_plugin_ctrlr_to_path_idx(const void *ctrlr)
 	/* Overflow — reuse last slot. resolved_idx already = MAX-1. */
 
 cache_update:
-	/* Insert into first empty cache slot, or replace slot 0 (LRU-ish for
-	 * 4-entry cache where ctrlr count rarely exceeds capacity). */
+	/* Insert into first empty cache slot, or replace slot 0. */
 	for (uint16_t i = 0; i < DPA_PLUGIN_PATH_MAX; i++) {
 		if (g_dpa_ctrlr_cache[i].ctrlr == NULL) {
 			g_dpa_ctrlr_cache[i].ctrlr = ctrlr;
@@ -3799,18 +3965,32 @@ cache_update:
 			return resolved_idx;
 		}
 	}
-	/* All cache slots full — overwrite slot 0 (rare; only when > 4 distinct
-	 * ctrlr pointers, which exceeds DPA_PLUGIN_PATH_MAX = 4 anyway). */
+	/* All cache slots full — overwrite slot 0. This is rare because the
+	 * cache dimension matches the supported controller count. */
 	g_dpa_ctrlr_cache[0].ctrlr = ctrlr;
 	g_dpa_ctrlr_cache[0].path_idx = resolved_idx;
 	return resolved_idx;
+}
+
+/* SAPS-Q rewrites notify-entry qp_id low bits to the process-local tenant ID
+ * before the DPA consumes an event.  Path verdict readers must use that same
+ * row.  SPDK qpair IDs are per-controller (normally 1 on every path), so
+ * indexing these tables with the raw qpair ID reads another tenant's row and
+ * makes a valid quarantine invisible to the selector. */
+static inline uint32_t
+dpa_plugin_path_qp_slot(uint16_t qp_id)
+{
+	if (g_ctx.ring && g_ctx.ring->sapsq_enabled &&
+	    g_sapsq_local_tenant_id < SAPSQ_MAX_TENANTS)
+		return g_sapsq_local_tenant_id & DPA_PLUGIN_CONN_MASK;
+	return (uint32_t)qp_id & DPA_PLUGIN_CONN_MASK;
 }
 
 uint32_t dpa_plugin_read_path_score(uint16_t qp_id, uint16_t path_id)
 {
 	if (__builtin_expect(!g_ctx.ring || !g_notify_enabled, 0))
 		return 0;
-	uint32_t qp_slot = (uint32_t)qp_id & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot = dpa_plugin_path_qp_slot(qp_id);
 	uint32_t path_slot = (uint32_t)path_id & DPA_PLUGIN_PATH_MASK;
 	return g_ctx.ring->per_qp_path_score[qp_slot][path_slot];
 }
@@ -3823,7 +4003,7 @@ uint32_t dpa_plugin_read_path_score_opcode(uint16_t qp_id, uint16_t path_id,
 		return 0;
 	if (opcode_class >= DPA_PLUGIN_OPC_CLASS_MAX)
 		return 0;
-	uint32_t qp_slot   = (uint32_t)qp_id   & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot   = dpa_plugin_path_qp_slot(qp_id);
 	uint32_t path_slot = (uint32_t)path_id  & DPA_PLUGIN_PATH_MASK;
 	return g_ctx.ring->per_qp_path_score_opcode[qp_slot][path_slot][opcode_class];
 }
@@ -3838,7 +4018,7 @@ uint32_t dpa_plugin_read_path_opc_p99(uint16_t qp_id, uint16_t path_id,
 		return 0;
 	if (opcode_class >= DPA_PLUGIN_OPC_CLASS_MAX)
 		return 0;
-	uint32_t qp_slot   = (uint32_t)qp_id   & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot   = dpa_plugin_path_qp_slot(qp_id);
 	uint32_t path_slot = (uint32_t)path_id  & DPA_PLUGIN_PATH_MASK;
 	return g_ctx.ring->per_qp_path_opc_p99[qp_slot][path_slot][opcode_class];
 }
@@ -3855,10 +4035,11 @@ int dpa_plugin_read_path_snapshot(uint16_t qp_id, uint16_t path_id,
 	out->opc_p99 = 0;
 	out->capacity = 0;
 	out->fault_type = 0;
+	out->state = DPA_SAPS_STATE_HEALTHY;
 	if (__builtin_expect(!g_ctx.ring || !g_notify_enabled, 0))
 		return 0;
 
-	uint32_t qp_slot = (uint32_t)qp_id & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot = dpa_plugin_path_qp_slot(qp_id);
 	uint32_t path_slot = (uint32_t)path_id & DPA_PLUGIN_PATH_MASK;
 
 	if (use_opcode_score && opcode_class < DPA_PLUGIN_OPC_CLASS_MAX) {
@@ -3869,6 +4050,7 @@ int dpa_plugin_read_path_snapshot(uint16_t qp_id, uint16_t path_id,
 	}
 	out->score = g_ctx.ring->per_qp_path_score[qp_slot][path_slot];
 	out->fault_type = g_ctx.ring->per_qp_path_fault_type[qp_slot][path_slot];
+	out->state = g_ctx.ring->per_qp_path_state[qp_slot][path_slot];
 	if (need_capacity || out->fault_type == DPA_PLUGIN_FAULT_PROPORTIONAL_THROTTLE) {
 		out->capacity = g_ctx.ring->per_qp_path_capacity[qp_slot][path_slot];
 	}
@@ -3880,7 +4062,7 @@ void dpa_plugin_prefetch_path_score_row(uint16_t qp_id)
 {
 	if (__builtin_expect(!g_ctx.ring || !g_notify_enabled, 0))
 		return;
-	uint32_t qp_slot = (uint32_t)qp_id & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot = dpa_plugin_path_qp_slot(qp_id);
 	__builtin_prefetch((const void *)&g_ctx.ring->per_qp_path_score[qp_slot][0],
 			   0 /* read */, 3 /* high temporal locality */);
 	__builtin_prefetch((const void *)&g_ctx.ring->per_qp_path_score_opcode[qp_slot][0][0],
@@ -3897,7 +4079,7 @@ uint8_t dpa_plugin_read_retry_verdict(uint16_t qp_id, uint16_t path_id)
 {
 	if (__builtin_expect(!g_ctx.ring || !g_notify_enabled, 0))
 		return DPA_SAPS_ACTION_UNSET;
-	uint32_t qp_slot = (uint32_t)qp_id & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot = dpa_plugin_path_qp_slot(qp_id);
 	uint32_t path_slot = (uint32_t)path_id & DPA_PLUGIN_PATH_MASK;
 	return g_ctx.ring->per_qp_path_retry_verdict[qp_slot][path_slot];
 }
@@ -3916,7 +4098,7 @@ uint16_t dpa_plugin_read_path_state(uint16_t qp_id, uint16_t path_id)
 {
 	if (__builtin_expect(!g_ctx.ring || !g_notify_enabled, 0))
 		return DPA_SAPS_STATE_HEALTHY;
-	uint32_t qp_slot = (uint32_t)qp_id & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot = dpa_plugin_path_qp_slot(qp_id);
 	uint32_t path_slot = (uint32_t)path_id & DPA_PLUGIN_PATH_MASK;
 	return g_ctx.ring->per_qp_path_state[qp_slot][path_slot];
 }
@@ -3929,7 +4111,7 @@ uint16_t dpa_plugin_read_path_fault_type(uint16_t qp_id, uint16_t path_id)
 {
 	if (__builtin_expect(!g_ctx.ring || !g_notify_enabled, 0))
 		return 0;  /* HEALTHY = 0 by enum saps_fault_type */
-	uint32_t qp_slot = (uint32_t)qp_id & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot = dpa_plugin_path_qp_slot(qp_id);
 	uint32_t path_slot = (uint32_t)path_id & DPA_PLUGIN_PATH_MASK;
 	return g_ctx.ring->per_qp_path_fault_type[qp_slot][path_slot];
 }
@@ -3938,7 +4120,7 @@ uint32_t dpa_plugin_read_path_capacity(uint16_t qp_id, uint16_t path_id)
 {
 	if (__builtin_expect(!g_ctx.ring || !g_notify_enabled, 0))
 		return 0;
-	uint32_t qp_slot = (uint32_t)qp_id & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot = dpa_plugin_path_qp_slot(qp_id);
 	uint32_t path_slot = (uint32_t)path_id & DPA_PLUGIN_PATH_MASK;
 	return g_ctx.ring->per_qp_path_capacity[qp_slot][path_slot];
 }
@@ -3947,7 +4129,7 @@ uint32_t dpa_plugin_read_qp_fault_mask(uint16_t qp_id)
 {
 	if (__builtin_expect(!g_ctx.ring || !g_notify_enabled, 0))
 		return 0;
-	uint32_t qp_slot = (uint32_t)qp_id & DPA_PLUGIN_CONN_MASK;
+	uint32_t qp_slot = dpa_plugin_path_qp_slot(qp_id);
 	return g_ctx.ring->per_qp_fault_mask[qp_slot][0];
 }
 
@@ -4118,6 +4300,33 @@ void dpa_plugin_shutdown(void)
 				g_ctx.ring->sapsq_epoch_commit_seq,
 				(unsigned long)g_ctx.ring->sapsq_stale_epoch_fallback,
 				(unsigned long)g_ctx.ring->sapsq_epoch_commit);
+			fprintf(stderr,
+				"dpa_plugin: SAPS-Q ring producer=%lu consumer=%lu "
+				"dpa_consumed=%lu overrun=%lu max_lag=%lu\n",
+				(unsigned long)g_ctx.ring->producer_idx,
+				(unsigned long)g_ctx.ring->consumer_idx,
+				(unsigned long)g_ctx.ring->dpa_consumed,
+				(unsigned long)g_ctx.ring->ring_overrun_count,
+				(unsigned long)g_ctx.ring->ring_max_lag);
+			for (uint32_t _t = 0; _t < g_ctx.ring->sapsq_num_tenants; _t++) {
+				fprintf(stderr,
+					"dpa_plugin: SAPS-Q attribution tenant=%u "
+					"host_published=%lu dpa_consumed=%lu\n",
+					_t,
+					(unsigned long)g_ctx.ring->host_submit_published[_t],
+					(unsigned long)g_ctx.ring->
+						dpa_submit_consumed_by_tenant[_t]);
+			}
+			for (uint32_t _p = 0; _p < g_ctx.ring->sapsq_num_paths; _p++) {
+				fprintf(stderr,
+					"dpa_plugin: SAPS-Q path %u capacity_iops=%lu "
+					"health_factor_q16=%u effective_capacity_iops=%lu\n",
+					_p,
+					(unsigned long)g_ctx.ring->sapsq_path_capacity_iops[_p],
+					g_ctx.ring->sapsq_committed_path_health_factor_q16[_p],
+					(unsigned long)g_ctx.ring->
+						sapsq_committed_path_effective_capacity_iops[_p]);
+			}
 			for (uint32_t _t = 0; _t < SAPSQ_MAX_TENANTS; _t++) {
 				if (g_ctx.ring->sapsq_tenant_weight[_t] == 0)
 					continue;
