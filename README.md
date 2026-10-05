@@ -1,4 +1,4 @@
-# SAPS: Semantics-Aware Path Steering for Disaggregated NVMe over Fabrics
+# SAPS: Coupling Path Health and Tenant Allocation for Stable Multi-Tenant NVMe-over-Fabrics
 
 This repository contains the prototype and experiment drivers used by the SAPS
 paper. SAPS treats path repair and tenant scheduling as one allocation problem.
@@ -29,7 +29,8 @@ bounded probe traffic needed to test recovery.
 ## Repository layout
 
 - `src/` contains the DPA program, the host library, and shared data structures.
-- `integration/spdk-patches/` records the SPDK hook points used by the prototype.
+- `integration/spdk/` contains the SPDK patch used by the prototype; see
+  `integration/spdk/README.md`.
 - `scripts/` contains the campaign drivers used by the current paper results.
 - `experiments/3path_targets/` contains the target setup scripts required by
   those campaigns.
@@ -59,9 +60,11 @@ Build the shared-memory inspection tool separately:
 cc -O2 -std=gnu11 -Isrc -o scripts/sapsq_dump scripts/sapsq_dump.c
 ```
 
-The SPDK integration files document the submit, completion, path-selection, and
-initialization hooks. They target the SPDK revision used by the prototype and
-should be reviewed before applying them to another revision.
+`integration/spdk/0001-saps-spdk-integration.patch` contains the submit,
+completion, path-selection, initialization, and target-side fault-injection
+changes used in the evaluation. It applies to SPDK commit
+`a83e52f1da18807e21b552a0fe35057f8e9ea586`; `integration/spdk/README.md` gives
+the build steps.
 
 ## Paper campaigns
 
@@ -128,8 +131,7 @@ Apache License 2.0. See `LICENSE`.
 If you use this artifact, cite:
 
 > Yong-Xuan Huang, Ming-Hung Chen, I-Hsin Chung, and Jerry Chou.
-> "SAPS: Semantics-Aware Path Steering for Disaggregated NVMe-over-Fabrics on
-> the SmartNIC Datapath." Future Generation Computer Systems, under review,
-> 2026.
+> "SAPS: Coupling Path Health and Tenant Allocation for Stable Multi-Tenant
+> NVMe-over-Fabrics." Future Generation Computer Systems, under review, 2026.
 
 A machine-readable record is available in `CITATION.cff`.

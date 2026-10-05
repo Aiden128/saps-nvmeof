@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite the paper below."
-title: "SAPS: Semantics-Aware Path Steering for Disaggregated NVMe-over-Fabrics on the SmartNIC Datapath (artifact)"
+title: "SAPS: Coupling Path Health and Tenant Allocation for Stable Multi-Tenant NVMe-over-Fabrics (artifact)"
 type: software
 authors:
   - family-names: Huang
@@ -18,7 +18,7 @@ authors:
 license: Apache-2.0
 preferred-citation:
   type: article
-  title: "SAPS: Semantics-Aware Path Steering for Disaggregated NVMe-over-Fabrics on the SmartNIC Datapath"
+  title: "SAPS: Coupling Path Health and Tenant Allocation for Stable Multi-Tenant NVMe-over-Fabrics"
   authors:
     - family-names: Huang
       given-names: Yong-Xuan

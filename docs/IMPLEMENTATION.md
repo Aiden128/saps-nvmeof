@@ -57,9 +57,10 @@ The prototype adds four classes of hooks to SPDK:
 3. A path selector that consumes the committed tenant row.
 4. Plugin initialization and shutdown in the benchmark process.
 
-The files under `integration/spdk-patches/` document these hook points. The
-live testbed was built from a pinned SPDK tree, so the patches should be ported
-by function and data-flow boundary when used with a different revision.
+`integration/spdk/0001-saps-spdk-integration.patch` implements these hook points.
+It applies to SPDK commit `a83e52f1da18807e21b552a0fe35057f8e9ea586`, the tree
+used by the testbed; port it by function and data-flow boundary for another
+revision.
 
 ## Experiment provenance
 
