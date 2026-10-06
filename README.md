@@ -34,6 +34,8 @@ bounded probe traffic needed to test recovery.
 - `scripts/` contains the campaign drivers used by the current paper results.
 - `experiments/3path_targets/` contains the target setup scripts required by
   those campaigns.
+- `experiments/supplementary/` contains the detector-baseline and
+  RocksDB experiments; see `experiments/supplementary/README.md`.
 - `evaluation/` retains the original experiment wrappers and standalone
   reference tools.
 - `docs/` describes the control loop, implementation boundary, runtime
