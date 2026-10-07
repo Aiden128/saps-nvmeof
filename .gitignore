@@ -1,6 +1,6 @@
 *.a
 build/
-/evaluation/sapsq_dump
+/scripts/sapsq_dump
 *.log
 *.o
 *.pyc

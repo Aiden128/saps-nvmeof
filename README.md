@@ -1,4 +1,4 @@
-# SAPS: Coupling Path Health and Tenant Allocation for Stable Multi-Tenant NVMe-over-Fabrics
+# SAPS: Semantics-Aware Path Steering for Multi-Tenant NVMe-over-Fabrics
 
 This repository contains the prototype and experiment drivers used by the SAPS
 paper. SAPS treats path repair and tenant scheduling as one allocation problem.
@@ -34,10 +34,10 @@ bounded probe traffic needed to test recovery.
 - `scripts/` contains the campaign drivers used by the current paper results.
 - `experiments/3path_targets/` contains the target setup scripts required by
   those campaigns.
-- `experiments/supplementary/` contains the detector-baseline and
-  RocksDB experiments; see `experiments/supplementary/README.md`.
-- `evaluation/` retains the original experiment wrappers and standalone
-  reference tools.
+- `experiments/supplementary/` contains the detector-baseline, delay-sweep,
+  placement, sampling, and RocksDB experiments; see
+  `experiments/supplementary/README.md`.
+- `evaluation/` contains the reference allocator used by the local checks.
 - `docs/` describes the control loop, implementation boundary, runtime
   configuration, and testbed procedure.
 
@@ -70,7 +70,7 @@ the build steps.
 
 ## Paper campaigns
 
-The current paper is backed by five campaign drivers:
+The paper is backed by these campaign drivers:
 
 - `scripts/run_signal_isolation_campaign.py` compares completion semantics,
   reachability, queue depth, and request completion time under matched faults.
@@ -83,9 +83,12 @@ The current paper is backed by five campaign drivers:
   across I/O sizes and read-write mixes.
 - `scripts/run_overhead_qd_campaign.py` measures healthy-path throughput cost
   across queue depths.
+- `experiments/supplementary/detector_baselines/` runs the detector-baseline
+  comparison, the binary health mode sweep, the placement comparison, and the
+  sampling sensitivity test.
+- `experiments/supplementary/rocksdb/` runs the RocksDB application test.
 
-These drivers are the source copies whose hashes are recorded by the experiment
-manifests. They retain the testbed's absolute paths, interface names, RPC
+These drivers retain the testbed's absolute paths, interface names, RPC
 sockets, and SSH host aliases. Edit those settings for another deployment.
 Raw measurements are intentionally not stored in this repository.
 
@@ -133,7 +136,6 @@ Apache License 2.0. See `LICENSE`.
 If you use this artifact, cite:
 
 > Yong-Xuan Huang, Ming-Hung Chen, I-Hsin Chung, and Jerry Chou.
-> "SAPS: Coupling Path Health and Tenant Allocation for Stable Multi-Tenant
-> NVMe-over-Fabrics." Future Generation Computer Systems, under review, 2026.
+> "SAPS: Semantics-Aware Path Steering for Multi-Tenant NVMe-over-Fabrics." Future Generation Computer Systems, under review, 2026.
 
 A machine-readable record is available in `CITATION.cff`.

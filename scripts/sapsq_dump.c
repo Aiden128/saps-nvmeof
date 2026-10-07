@@ -1,27 +1,3 @@
-/*
- * sapsq_dump.c — read-only SAPS counter dumper
- *
- * Usage:   sudo sapsq_dump /proc/<pid>/fd/<n>
- * Output:  JSON to stdout — contains the active M-series budget plane,
- *          per-(tenant, path) enforcement counters, path health, and the
- *          older compatibility plane for diagnosis.
- *
- * Build:
- *   gcc -O2 -Wall -I../dpa-smart-initiator/flexio_build/samples/dpa_plugin \
- *       -o sapsq_dump sapsq_dump.c
- *
- * 為什麼用 /proc/<pid>/fd/<n>:
- *   dpa_plugin 用 memfd_create("dpa_plugin_ring", ...) 在 standalone proc 內
- *   建 ring,memfd 不是 file-backed,外部無法直接 open()。但 Linux procfs 把
- *   memfd 暴露成 /proc/<pid>/fd/<n>(target = "/memfd:dpa_plugin_ring (deleted)"),
- *   sudo 對它做 open() + mmap() PROT_READ + MAP_SHARED 可以讀同一塊 anonymous
- *   shared memory page。tenant bdevperf proc 用 PROT_READ|PROT_WRITE 寫,本
- *   helper 用 PROT_READ 讀,不會競爭。
- *
- * NOTE: 不要寫 ring(只讀)。bdevperf hot path 仍在跑時讀 counter 是 best-effort
- * snapshot,counter 是 uint64 atomic-relaxed counter,讀到 torn value 機率極低
- * (aarch64 8-byte align natural load is atomic)。
- */
 
 #include <errno.h>
 #include <fcntl.h>

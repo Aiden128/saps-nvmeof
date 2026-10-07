@@ -278,36 +278,11 @@ enum saps_fault_type {
 	SAPS_FAULT_SHARED_FATE    = 8,
 	SAPS_FAULT_PROPORTIONAL_THROTTLE = 9,
 	SAPS_FAULT_ALL_DEGRADED   = 10,
-	SAPS_FAULT_M2_SUSPECT     = 11,   /* M2: PCA loading entropy 偏離 baseline */
+	SAPS_FAULT_M2_SUSPECT     = 11,    
 };
 
 #define SAPS_BOCPD_RUN_MAX 8u
 
-/* ============================================================================
- * 出貨偵測器集合 (shipping detector set) — 誠實揭露 (honesty disclosure)
- * ----------------------------------------------------------------------------
- * 此區塊紀錄分類器 (classifier) 實際啟用的偵測器,使 code 與出貨設定
- * (shipping config) 一致,避免 reviewer 誤判為過度擬合 (reviewer-overfit) 或
- * 死碼 (dead-code) 殘留。
- *
- * ACTIVE (出貨啟用) — 真正參與 shipping classifier 判決:
- *   - NEWMA 變換點偵測 (change-point detection, §4.6 Keriven NeurIPS 2020)
- *   - Frugal-2U P99 尾延遲偵測 (streaming P99 tail, §4.3 ANALCO 2014)
- *   - B7 = SAPS_D2_B7_ENABLE (ANY_THREE_VOTE 門檻投票 threshold vote)
- *   - B8 = SAPS_D2_B8_ENABLE (SHARED_FATE 跨路徑共命運偵測 shared-fate)
- *
- * DISABLED-BY-DESIGN (編譯關閉 compile-gated 0) — 已實作且做過離線研究
- * (implemented + offline-studied),但「不在」出貨分類器內:
- *   - B1 = SAPS_D2_B1_ENABLE  BOCPD (貝氏線上變換點 Bayesian online change-point)
- *   - B2 = SAPS_D2_B2_ENABLE  CUSUM (累積和 cumulative sum)
- *   - B3 = SAPS_D2_B3_ENABLE
- *   - B4 = SAPS_D2_B4_ENABLE  ADWIN (自適應視窗 adaptive windowing)
- *   - B5 = SAPS_D2_B5_ENABLE
- *   - B6 = SAPS_D2_B6_ENABLE
- *   這些保留 source 供離線重現 (offline reproducibility),compile-gated 為 0,
- *   不影響 shipping 判決路徑 (decision path)。
- * ============================================================================
- */
 #define SAPS_D2_B1_ENABLE 0
 #define SAPS_D2_B2_ENABLE 0
 #define SAPS_D2_B3_ENABLE 0
@@ -376,31 +351,17 @@ struct dpa_path_state {
 	uint32_t capacity_score;
 	uint32_t _pad_capacity;
 
-	/* B8 SHARED_FATE 服務能力 (service-capacity) 判據新增欄位 (2026-06-11)。
-	 *
-	 * 背景:60s 的 capacity_rate_ewma_q16 對 50ms rotation 太慢。
-	 * 單一路徑 D1 故障下,健康路徑因 re-steer 暫態加壓 (queueing pressure),
-	 * 原本只看延遲 (latency) 的 fallback 會把純排隊誤判成劣化 (degraded)。
-	 * 改用服務能力 (service capacity):純排隊時完成率 (completion rate) 與
-	 * QD-正規化延遲 (QD-normalized latency) 不動,只有真服務變慢才升。
-	 *
-	 * 快窗 (fast window, ~8ms) 完成率:long EWMA 只當 baseline,快窗當
-	 * current evidence。rate_fast_q16 = 上一個完整快窗的 completions << 16。 */
-	uint64_t cap_fast_win_start_tsc;   /* 當前快窗起點 (host_tsc) */
-	uint32_t cap_fast_win_completions; /* 當前快窗累積完成數 */
-	uint32_t rate_fast_q16;            /* 上個完整快窗完成數 (Q16.16/win) */
+	uint64_t cap_fast_win_start_tsc;    
+	uint32_t cap_fast_win_completions;  
+	uint32_t rate_fast_q16;             
 
-	/* 服務能力 baseline (僅在 path healthy + 低 QD + err 低時更新,反映
-	 * 未加載 (unloaded) 的服務)。整數運算,熱路徑只讀 cached boolean。 */
 	uint32_t cap_score_base;           /* baseline rate_fast/qd (Q16/QD unit) */
-	uint32_t cap_rate_base;            /* baseline rate_fast 上限 (Q16.16/win) */
-	uint32_t qd_base;                  /* baseline 整數 QD (qd_mean>>16) */
-	int64_t  norm_log_lat_base;        /* baseline 之 (mean_log_lat − log2(qd)) */
+	uint32_t cap_rate_base;             
+	uint32_t qd_base;                   
+	int64_t  norm_log_lat_base;         
 
-	/* 服務能力 degraded 判據的 persistence:最近 3 個 telemetry tick 的
-	 * degraded boolean 環 (2-of-3 才算,濾暫態 transient)。bit0=最新。 */
 	uint8_t  sf_degraded_history;      /* 3-bit history of per-tick degraded */
-	uint8_t  sf_degraded_cached;       /* persistence 後的 cached verdict */
+	uint8_t  sf_degraded_cached;        
 	uint8_t  _pad_sf_cap[6];
 
 	/* Error histogram [sct 0..3][sc & 0xF] (§4.5 semantic classifier). */
@@ -1002,37 +963,22 @@ static inline uint32_t sapsq_continuous_health_from_drift(int64_t drift);
 #define SAPS_T_SHARED_FATE_EXCLUDE_TICKS   (50ull * SAPS_TICKS_PER_MS)
 #define SAPS_T_SHARED_FATE_LEASE_TICKS     (1000ull * SAPS_TICKS_PER_MS)
 
-/* B8 SHARED_FATE 服務能力 (service-capacity) 判據常數 (2026-06-11)。
- *
- * 一條路徑只在服務率低於自身 baseline 或 err_rate 高時被判為
- * shared-fate degraded,不是只因延遲 (latency) 高。用 ratio 比較
- * 全整數,RATIO_DEN=1024 當定點分母。 */
 #define SAPS_SF_RATIO_DEN          1024u
-#define SAPS_SF_RATE_BAD_NUM       717u   /* current < 70% expected → 真劣化 */
-#define SAPS_SF_RATE_OK_NUM        870u   /* current >= 85% expected → 服務正常 */
+#define SAPS_SF_RATE_BAD_NUM       717u    
+#define SAPS_SF_RATE_OK_NUM        870u    
 #define SAPS_SF_SCORE_BAD_NUM      717u   /* capacity_score < 70% baseline */
 
-/* QD guards (整數 QD,= qd_mean>>16)。 */
-#define SAPS_SF_QD_DEMAND_MIN      2u     /* QD<2 不判 (除非有 error) */
-#define SAPS_SF_QD_PRESSURE_MIN    8u     /* 排隊壓力下限 */
-#define SAPS_SF_QD_PRESSURE_MULT   2u     /* 且 qd >= qd_base × 2 → 明確塞車 */
-/* 服務曲線拐點 (service knee):QD 高於此,rate/QD 因無害排隊自然下降,
- * raw capacity_score 不再可信。4KB randread QD=32 飽和負載下單路徑健康
- * QD≈10,拐點取 16 (整數 QD)。 */
+#define SAPS_SF_QD_DEMAND_MIN      2u      
+#define SAPS_SF_QD_PRESSURE_MIN    8u      
+#define SAPS_SF_QD_PRESSURE_MULT   2u      
 #define SAPS_SF_QD_KNEE            16u
 
-/* Q16.16 log2 延遲門檻。LAT_BAD = baseline ×1.5 (log2(1.5)≈0.585→Q16≈38336);
- * NLAT_BAD = QD-正規化延遲 baseline ×1.33 (log2(4/3)≈0.415→Q16≈27200)。 */
 #define SAPS_SF_LAT_BAD_DELTA_Q16   38336
 #define SAPS_SF_NLAT_BAD_DELTA_Q16  27200
 
-/* err_rate_ewma 門檻 (Q16.16):≥ 0.05 (= 3277) 視為 error 證據充足。 */
 #define SAPS_SF_ERR_BAD_Q16         3277
 
-/* 快窗 (fast window) 長度:8ms,遠快於 50ms rotation,足以濾單一 IO 抖動。
- * 用 SAPS_TICKS_PER_MS (與 saps_capacity_on_complete 的 host_tsc 時鐘一致)。 */
 #define SAPS_SF_FAST_WIN_TICKS      (8ull * SAPS_TICKS_PER_MS)
-/* persistence:3-tick 環,2-of-3 degraded 才算 (popcount(history & 0x7) >= 2)。 */
 #define SAPS_SF_PERSIST_NEED        2u
 
 /* 250 us @ 1.5 GHz = 375000 ticks; log2(375000) ~= 18.52.
@@ -1542,10 +1488,6 @@ static inline int64_t fixed_inv_q16(int64_t x)
 	return ((int64_t)1 << 32) / x;   /* (1<<16)<<16 / x gives Q16.16 result */
 }
 
-/* M2 helper:1/sqrt(x) in Q16.16,3 次 Newton iteration。
- * 推導:y_q16 = 2^24 / sqrt(x_q16);初始猜值用 bit-scan 上 MSB index 給
- * 2^(24 - (bl-1)/2),Newton 跑 y ← y(3 - x·y²)/2 三次收斂到 < 1e-6 相對誤差。
- * 對應 specs/m2-dpa-implementation-plan-20260519.md §2.3。 */
 static inline int64_t fixed_invsqrt_q16(int64_t x_q16)
 {
 	if (x_q16 <= 0)
@@ -1560,13 +1502,8 @@ static inline int64_t fixed_invsqrt_q16(int64_t x_q16)
 		y = 1;
 	else
 		y = (int64_t)1 << 62;
-	/* Half-bit correction:當 (bl-1) odd,sqrt(x) 有 sqrt(2) 因子,
-	 * 把 initial y 乘以 1/sqrt(2) ≈ 46341/65536,讓 Newton 從近似根開始。 */
 	if (((bl - 1u) & 1u) != 0u)
 		y = (y * 46341LL) >> 16;
-	/* 4 iter:從 §2.3 推導的 3 iter 經 cross-verify 在 (bl-1)%2==1
-	 * + 低/高 SNR 區域 max rel err ~1.8%;再多 1 iter 把 max err 壓到 < 0.5%。
-	 * Cost +~10 cycles,在 245 ns budget 內可吸收。 */
 	for (int i = 0; i < 4; i++) {
 		int64_t y_sq_q16 = (y * y) >> 16;
 		int64_t xy_sq_q16 = (x_q16 * y_sq_q16) >> 16;
@@ -1578,17 +1515,8 @@ static inline int64_t fixed_invsqrt_q16(int64_t x_q16)
 	return y;
 }
 
-/* M2 baseline-frozen flag — DPA-private(host 不需讀),per-client。
- * 取代原本不可達的 `n == M2_WARMUP_N` snapshot 相等判斷:因為 sub-sample
- * gate 讓進到 body 的 n 永遠是 8k,body 後 n 變 8k+1,1100 % 8 == 4 永遠跳不到。
- * 改用 frozen flag:第一次 n >= M2_WARMUP_N 時 snapshot 並 set frozen。 */
 static uint8_t g_m2_baseline_frozen[M2_CLIENT_MAX];
 
-/* M2 streaming PCA — per-client Oja update (8-feature × Q16.16)。
- * 每筆 IO complete 跑一次(經 1/8 sub-sample),維護 per-client w_c ∈ R^8,
- * warmup 結束 snapshot baseline,之後每步算 cosine to baseline 給 host
- * non-hot-path 跑 entropy 三分類。
- * 對應 specs/m2-dpa-implementation-plan-20260519.md §2.1 / §3.1 / §3.3。 */
 static inline void m2_oja_update(volatile struct dpa_plugin_shared *s,
 				  uint16_t client_id,
 				  const int64_t x[M2_FEATURE_DIM])
@@ -1597,7 +1525,6 @@ static inline void m2_oja_update(volatile struct dpa_plugin_shared *s,
 		return;
 	uint32_t n = s->m2_pca_n_events[client_id];
 
-	/* Sub-sample gate:每 (1<<M2_SUBSAMPLE_LOG2) 個 event 才跑一次 Oja。 */
 	if ((n & M2_SUBSAMPLE_MASK) != 0) {
 		s->m2_pca_n_events[client_id] = n + 1u;
 		return;
@@ -1605,7 +1532,6 @@ static inline void m2_oja_update(volatile struct dpa_plugin_shared *s,
 
 	volatile int64_t *w = s->m2_pca_w[client_id];
 
-	/* Cold init:第一次 update 用 normalize(x) 當 initial w_c */
 	if (n == 0) {
 		int64_t sumsq_init = 0;
 		for (int i = 0; i < M2_FEATURE_DIM; i++)
@@ -1624,7 +1550,6 @@ static inline void m2_oja_update(volatile struct dpa_plugin_shared *s,
 	for (int i = 0; i < M2_FEATURE_DIM; i++)
 		dot_q16 += ((int64_t)x[i] * w[i]) >> 16;
 
-	/* Step 2: w_new = w + η·s·x  +  累積 ‖w_new‖² */
 	int64_t step_q16 = (dot_q16 * (int64_t)M2_ETA_Q16) >> 16;
 	int64_t w_new[M2_FEATURE_DIM];
 	int64_t sumsq = 0;
@@ -1644,10 +1569,6 @@ static inline void m2_oja_update(volatile struct dpa_plugin_shared *s,
 	n++;
 	s->m2_pca_n_events[client_id] = n;
 
-	/* Step 4: warmup snapshot once at WARMUP_N。用 frozen flag 取代 `n ==
-	 * M2_WARMUP_N` 相等判斷 — sub-sample gate 使 n 永遠 8k+1,相等判斷不可達
-	 * (1100 % 8 == 4),baseline 永遠是 0、conf_q16 永遠 0。改成 frozen-once:
-	 * 第一次 n >= M2_WARMUP_N 就 snapshot 並 set frozen,之後不再覆寫 baseline。 */
 	volatile int64_t *wb = s->m2_pca_w_baseline[client_id];
 	if (!g_m2_baseline_frozen[client_id] && n >= M2_WARMUP_N) {
 		for (int i = 0; i < M2_FEATURE_DIM; i++)
@@ -1656,8 +1577,6 @@ static inline void m2_oja_update(volatile struct dpa_plugin_shared *s,
 		return;
 	}
 
-	/* Step 5: post-warmup cosine confidence to baseline — 只在 baseline
-	 * 已 frozen 後才算(避免讀到尚未 snapshot 的全零 baseline)。 */
 	if (g_m2_baseline_frozen[client_id]) {
 		int64_t conf_q16 = 0;
 		for (int i = 0; i < M2_FEATURE_DIM; i++)
@@ -1666,10 +1585,6 @@ static inline void m2_oja_update(volatile struct dpa_plugin_shared *s,
 	}
 }
 
-/* M3 WMM credit ledger — per-tenant credit refresh + decrement。對應
- * specs/m3-dpa-implementation-plan-20260519.md §2.2。每筆 IO complete
- * 跑一次:先 refresh credit(based on w × Δtsc × capacity),再扣 1 IO。
- * v1 observability only,return 值 host 不讀。 */
 static inline void m3_refresh_credit(volatile struct dpa_plugin_shared *s,
 				      uint32_t tenant_id, uint64_t now_tsc)
 {
@@ -1699,9 +1614,6 @@ static inline void m3_refresh_credit(volatile struct dpa_plugin_shared *s,
 	s->m3_tenant_credits_q32[tenant_id] = credits;
 	s->m3_tenant_last_tsc[tenant_id] = now_tsc;
 
-	/* v3-A2 (2026-05-20):sticky freeze unfreeze on refresh。當 credit 累積
-	 * 到 ≥ 16 IO 的水位才 unfreeze,避免 freeze 與 m3_consume per-IO 翻轉
-	 * 讓 host fast-path 沒機會 see freeze=1 sticky 狀態。 */
 	if (s->m3_v3_freeze_gate &&
 	    credits >= ((int64_t)16 << 32) &&
 	    s->m3_tenant_freeze[tenant_id]) {
@@ -1725,16 +1637,6 @@ static inline bool m3_consume(volatile struct dpa_plugin_shared *s,
 	return false;
 }
 
-/* M3 v2 (M4 namespace, 2026-05-20):in-DPA per-tenant token bucket。
- *
- * Refresh: tokens_q16 += min((tsc_now - last_refresh_tsc) * refresh_per_tsc_q16,
- *                            burst_cap_q16 - tokens_q16),clamp to burst_cap_q16
- * Consume: tokens_q16 >= (1<<16) → tokens_q16 -= (1<<16), reject_flag=0
- *          else → reject_flag = 1
- *
- * 與 M3 v1/v2/v3 完全獨立的 namespace,共用 process_event hot path 但獨立
- * state field(避開 per_qp_tokens wrap、binary freeze flap 等 root cause)。
- */
 static inline void m4_refresh_and_consume(volatile struct dpa_plugin_shared *s,
 					   uint32_t tenant_id, uint64_t now_tsc)
 {
@@ -1926,26 +1828,6 @@ static inline void newma_reset(struct dpa_path_state *p)
 	p->ewma_fast = p->ewma_slow;
 }
 
-/* §4.3 direct P99 scoring — no Kingman variance proxy.
- *
- *   base      = SCALE_q16 / p99                 (1/P99 base signal)
- *   opc_boost = SCALE_q16 / opc_p99[opcode]    (per-opcode tail signal)
- *   total     = (base * opc_boost) >> 16 − err_pen − qd_pen
- *
- * All latency quantiles are in Q16.16 log-lat (bits above baseline). Lower
- * log-lat ⇒ higher score.
- *
- * Warmup handling: return 0 (sentinel for "not yet sampled"). saps_update()
- * treats 0 specially and SKIPS the shared-table write, so per_qp_path_score
- * stays at its boot-init zero until enough clean samples (n >= WARMUP_N)
- * exist to evaluate a real score. The host side (bdev_nvme.c
- * dpa_plugin_select_io_path) already uses score==0 as the
- * "未採樣,走 exploration round-robin" contract, so honouring it from the
- * DPA side makes the cold-start path fair across all paths. Earlier code
- * returned SCALE/2 (524288) as a warmup neutral; that value dominated real
- * steady-state scores (~46k on a 5ms slow path), so argmax locked onto
- * whichever path was still warming up — the root cause of the Matrix v3
- * D1/D7 sticky/erratic distribution. */
 static inline uint32_t compute_score(struct dpa_path_state *p, uint8_t opcode)
 {
 	if (__builtin_expect(p->state == DPA_SAPS_STATE_EXCLUDED, 0))
@@ -2059,8 +1941,6 @@ static inline uint32_t compute_score(struct dpa_path_state *p, uint8_t opcode)
 	 *                    last-pre-flap state. */
 	switch (p->fault_type) {
 	case SAPS_FAULT_PERPETUAL_SLOW:
-		/* SAPS_SCORE_MIN 為情境校準動作常數 (scenario-calibrated action
-		 * constant),非演算法導出值 (not algorithm-derived). */
 		total = SAPS_SCORE_MIN;
 		break;
 	case SAPS_FAULT_ONSET:
@@ -2081,8 +1961,6 @@ static inline uint32_t compute_score(struct dpa_path_state *p, uint8_t opcode)
 		 * recovery samples on the path so SPARSE_ERROR can clear once
 		 * the error window passes.  Retry-overlay is preserved at the
 		 * SPDK layer for the residual probe traffic. */
-		/* SAPS_SCORE_MIN 為情境校準動作常數 (scenario-calibrated action
-		 * constant),非演算法導出值 (not algorithm-derived). */
 		total = SAPS_SCORE_MIN;
 		break;
 		case SAPS_FAULT_BIMODAL_TAIL:
@@ -2093,15 +1971,8 @@ static inline uint32_t compute_score(struct dpa_path_state *p, uint8_t opcode)
 		 * from spec §4.2 ("probabilistic shedding, not exclude") — see
 		 * report §6 for the trade-off (sacrifices the 85% fast-path
 		 * capacity to bound P99.9). */
-			/* SAPS_SCORE_MIN 為情境校準動作常數 (scenario-calibrated
-			 * action constant),非演算法導出值 (not algorithm-derived). */
 			total = SAPS_SCORE_MIN;
 			break;
-		/* Fix 13 reverted 2nd time — combo with Fix 14 caused catastrophic
-		 * n1=42.7% / IOPS 90K because A/C also transiently FLAP → all paths
-		 * score=1 → equal WRS weights → re-balance + B slow tail dominates.
-		 * Conclusion: FLAP score override is too aggressive,需 path-specific
-		 * 判斷 (e.g. fault history) 才能 safely 用。 */
 		case SAPS_FAULT_SHARED_FATE:
 		case SAPS_FAULT_PROPORTIONAL_THROTTLE:
 		case SAPS_FAULT_ALL_DEGRADED:
@@ -2308,16 +2179,6 @@ static inline void saps_capacity_on_complete(struct dpa_path_state *p,
 	saps_capacity_refresh_score(p);
 }
 
-/* B8 服務能力快窗 (fast window) + baseline 維護 (2026-06-11)。
- *
- * 每個 complete 呼叫,但重 telemetry 只在快窗 (~8ms) 滾動時跑,熱路徑代價極小。
- * 完成一個快窗時:
- *   - rate_fast_q16 ← 該窗完成數 (Q16.16),當 current 服務率證據。
- *   - 只有在 path「未加載且健康」(HEALTHY + 低 QD + err 低 + 延遲未壞) 才更新
- *     baseline (cap_score_base / cap_rate_base / qd_base / norm_log_lat_base),
- *     反映未受排隊壓力 (queueing pressure) 影響的真實服務能力。
- * 整數運算,無除法熱路徑(僅窗滾動時一次定點除)。
- * 回傳 true 表示此次呼叫剛滾過一個完整快窗 (供呼叫端更新 persistence)。 */
 static inline bool saps_capacity_fast_tick(struct dpa_path_state *p,
 					   uint64_t host_tsc)
 {
@@ -2328,7 +2189,6 @@ static inline bool saps_capacity_fast_tick(struct dpa_path_state *p,
 		p->cap_fast_win_completions = 0;
 	} else if (host_tsc - p->cap_fast_win_start_tsc >= SAPS_SF_FAST_WIN_TICKS) {
 		rolled = true;
-		/* 窗滿:固化 current 服務率,並嘗試更新 baseline。 */
 		uint32_t win_done = p->cap_fast_win_completions;
 		p->rate_fast_q16 = win_done << 16;
 
@@ -2337,8 +2197,6 @@ static inline bool saps_capacity_fast_tick(struct dpa_path_state *p,
 		bool lat_ok = (p->baseline_log_lat_q16 == 0) ? true :
 			(p->mean_log_lat_ewma_q16 - p->baseline_log_lat_q16
 				< (int64_t)SAPS_SF_LAT_BAD_DELTA_Q16);
-		/* 只在健康、未加載 (QD < 拐點 knee)、err 低、延遲未壞時學 baseline。
-		 * 加載中 (re-steer 加壓) 或故障時凍結,避免污染未加載服務能力基準。 */
 		bool unloaded_healthy =
 			p->n >= SAPS_WARMUP_N &&
 			p->state == DPA_SAPS_STATE_HEALTHY &&
@@ -2348,7 +2206,6 @@ static inline bool saps_capacity_fast_tick(struct dpa_path_state *p,
 
 		if (unloaded_healthy && win_done > 0) {
 			uint32_t qd_eff = qd_int < 1u ? 1u : qd_int;
-			/* cap_score_base = rate_fast / qd (Q16.16/QD unit)。 */
 			uint32_t score = (uint32_t)(p->rate_fast_q16 / qd_eff);
 			uint32_t nqd = qd_int < SAPS_SF_QD_DEMAND_MIN
 				? SAPS_SF_QD_DEMAND_MIN : qd_int;
@@ -2361,7 +2218,6 @@ static inline bool saps_capacity_fast_tick(struct dpa_path_state *p,
 				p->qd_base = qd_eff;
 				p->norm_log_lat_base = norm;
 			} else {
-				/* EWMA α=1/8 平滑 baseline。 */
 				p->cap_score_base += ((int32_t)score - (int32_t)p->cap_score_base) >> 3;
 				if (p->cap_score_base == 0)
 					p->cap_score_base = 1;
@@ -2383,8 +2239,6 @@ static inline bool saps_capacity_fast_tick(struct dpa_path_state *p,
 	return rolled;
 }
 
-/* 期望服務率 (expected rate):baseline 每-QD 服務能力 × 有效 QD (截到拐點),
- * 不超過 baseline 觀測到的最高率。整數定點 (Q16.16/win)。 */
 static inline uint32_t saps_sf_expected_rate(const struct dpa_path_state *p)
 {
 	uint32_t qd_int = (uint32_t)(p->qd_mean >> 16);
@@ -2413,12 +2267,6 @@ static inline bool saps_sf_ratio_ge(uint32_t cur, uint32_t base,
 	return ((uint64_t)cur * den) >= ((uint64_t)base * num);
 }
 
-/* 服務能力 (service-capacity) 單-tick degraded 判據 (2026-06-11)。
- *
- * 核心:純排隊壓力 (queueing pressure) 的健康路徑「延遲高但服務率正常」,
- * 真劣化/共命運 (shared-fate) 路徑「服務率掉 或 QD-正規化延遲升 或 err 高」。
- * 回傳「此 tick 是否 degraded」;persistence (2-of-3) 由呼叫端套用。
- * 重算放此 tick 函式,熱路徑只讀 cached p->sf_degraded_cached。 */
 static inline bool saps_sf_path_degraded_this_tick(const struct dpa_path_state *p)
 {
 	uint32_t qd_int;
@@ -2426,46 +2274,37 @@ static inline bool saps_sf_path_degraded_this_tick(const struct dpa_path_state *
 	uint32_t exp_rate;
 	int64_t norm_log_lat;
 
-	/* err_rate 高 → 直接算 degraded (與 QD 無關)。 */
 	if (p->err_rate_ewma >= (int64_t)SAPS_SF_ERR_BAD_Q16)
 		return true;
 
-	/* baseline 尚未學到 → 無服務能力基準可比,保守不判 (避免暖機誤觸)。 */
 	if (p->cap_score_base == 0)
 		return false;
 
 	qd_int = (uint32_t)(p->qd_mean >> 16);
 
-	/* Guard:QD 太低 (<2) 不判 (除非有 error,上面已處理)。 */
 	demand = qd_int >= SAPS_SF_QD_DEMAND_MIN || p->inflight >= SAPS_SF_QD_DEMAND_MIN;
 	if (!demand)
 		return false;
 
-	/* 延遲壞 (相對自身凍結 baseline ×1.5)。延遲只是必要前置,不是充分條件。 */
 	lat_bad = p->baseline_log_lat_q16 != 0 &&
 		(p->mean_log_lat_ewma_q16 - p->baseline_log_lat_q16
 			>= (int64_t)SAPS_SF_LAT_BAD_DELTA_Q16);
 	if (!lat_bad)
 		return false;
 
-	/* 明確塞車:QD 高且遠超自身 baseline QD → 排隊壓力證據。 */
 	pressure = qd_int >= SAPS_SF_QD_PRESSURE_MIN &&
 		(p->qd_base != 0 && qd_int >= p->qd_base * SAPS_SF_QD_PRESSURE_MULT);
 
-	/* 快窗服務率 vs 期望率。 */
 	exp_rate = saps_sf_expected_rate(p);
 	rate_bad = saps_sf_ratio_lt(p->rate_fast_q16, exp_rate,
 				    SAPS_SF_RATE_BAD_NUM, SAPS_SF_RATIO_DEN);
 	rate_ok = saps_sf_ratio_ge(p->rate_fast_q16, exp_rate,
 				   SAPS_SF_RATE_OK_NUM, SAPS_SF_RATIO_DEN);
 
-	/* raw capacity_score 只在拐點 (knee) 附近以下可信:QD 高於拐點時 rate/QD
-	 * 因無害排隊自然下降,不可當服務劣化證據。 */
 	score_bad = qd_int <= ((SAPS_SF_QD_KNEE * 5u) / 4u) &&
 		saps_sf_ratio_lt(p->capacity_score, p->cap_score_base,
 				 SAPS_SF_SCORE_BAD_NUM, SAPS_SF_RATIO_DEN);
 
-	/* QD-正規化延遲 (QD-normalized latency):純排隊不動,真服務變慢才升。 */
 	{
 		uint32_t nqd = qd_int < SAPS_SF_QD_DEMAND_MIN
 			? SAPS_SF_QD_DEMAND_MIN : qd_int;
@@ -2475,8 +2314,6 @@ static inline bool saps_sf_path_degraded_this_tick(const struct dpa_path_state *
 	nlat_bad = (norm_log_lat - p->norm_log_lat_base)
 			>= (int64_t)SAPS_SF_NLAT_BAD_DELTA_Q16;
 
-	/* false-positive 抑制器:延遲壞,但排隊壓力高且服務率仍正常且 QD-正規化
-	 * 延遲未升 → 純塞車,不算 degraded。 */
 	if (pressure && rate_ok && !nlat_bad)
 		return false;
 
@@ -2484,13 +2321,9 @@ static inline bool saps_sf_path_degraded_this_tick(const struct dpa_path_state *
 	if (rate_ok && !rate_bad && !score_bad)
 		return false;
 
-	/* 真服務劣化:服務率掉、或 raw score 掉、或 QD-正規化延遲升。 */
 	return rate_bad || score_bad || nlat_bad;
 }
 
-/* persistence:每個快窗滾動時呼叫一次。把此 tick 的服務能力 degraded verdict
- * 推進 3-bit history 環,2-of-3 才把 sf_degraded_cached 設為 1 (濾暫態 transient,
- * 並讓 D7 在 ~2-3 快窗 = 16-24ms 內仍可確認)。熱路徑只讀 sf_degraded_cached。 */
 static inline void saps_sf_persist_update(struct dpa_path_state *p)
 {
 	uint8_t hist = (uint8_t)((p->sf_degraded_history << 1) & 0x7u);
@@ -2517,14 +2350,6 @@ static inline bool saps_shared_fate_path_has_degraded_evidence(const struct dpa_
 	if (saps_shared_fate_is_local_fault(p->fault_type))
 		return true;
 
-	/* FSM 狀態分支:EXCLUDED 無條件算 degraded(真被排除的壞路徑應計入)。
-	 * DEGRADING / RECOVERING 加 sf_degraded_cached gate:
-	 * 單路徑 D1 下,健康 A/C 因排隊壓力 (queueing pressure) 也會 HEALTHY→DEGRADING,
-	 * 但 capacity 判據顯示服務率正常 (sf_degraded_cached=0) → 不算 degraded,避免
-	 * 誤湊 2 條觸發 SHARED_FATE。EXCLUDED 不加 gate:壞路徑 B 在 EXCLUDED 時
-	 * re-steer 完成率為 0,capacity baseline 可能未學或不準,保守起見無條件算。
-	 * D7 真共命運:兩條路徑服務真掉 → capacity 掉 → sf_degraded_cached=1 →
-	 * DEGRADING 仍通過 gate → degraded≥2 → SHARED_FATE 正常觸發。 */
 	if (p->fault_type != SAPS_FAULT_SHARED_FATE) {
 		if (p->state == DPA_SAPS_STATE_EXCLUDED)
 			return true;
@@ -4338,8 +4163,6 @@ static inline void saps_update(volatile struct dpa_plugin_shared *s,
 
 	p->last_complete_tsc = host_tsc;
 	saps_capacity_on_complete(p, host_tsc);
-	/* B8 服務能力 (service-capacity) 快窗 + persistence。重 telemetry 算只在
-	 * 快窗 (~8ms) 滾動時跑;熱路徑 (shared-fate 判據) 只讀 sf_degraded_cached。 */
 	if (saps_capacity_fast_tick(p, host_tsc))
 		saps_sf_persist_update(p);
 
@@ -4492,9 +4315,6 @@ static inline void saps_update(volatile struct dpa_plugin_shared *s,
 			ring_push(p->newma_fire_tsc_ms_ring,
 				   &p->newma_fire_ring_head, 8, now_ms_fire);
 
-			/* M1 spike (2026-05-17): NEWMA fire TSC console log.
-			 * Stride 1/64 抑制 ring-fill;M1 量測只關心「第一次 fire」,
-			 * 後續高頻 fire 是 FLAP 重複,host parser 過濾。 */
 			static uint64_t g_m1_fire_stride;
 			if ((g_m1_fire_stride++ & 0x3F) == 0) {
 				flexio_dev_print(
@@ -4814,9 +4634,6 @@ static inline void saps_update(volatile struct dpa_plugin_shared *s,
 	}
 	} /* end: !sapsq_bypass_saps_fsm */
 
-	/* D4 trace instrumentation (2026-05-17). 量 path-level FSM dwell
-	 * histogram + fault_type 分佈 + transition matrix。Hot path overhead:
-	 * 3 cacheline-aligned 64-bit increments per classifier call。 */
 	if (path_idx < DPA_PLUGIN_PATH_MAX) {
 		uint16_t st_after  = (uint16_t)p->state;
 		uint16_t ft_after  = (uint16_t)new_fault;
@@ -5035,11 +4852,6 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
 	uint16_t qp_idx_real = qp & DPA_PLUGIN_CONN_MASK;
 	uint16_t path_idx_real = path & DPA_PLUGIN_PATH_MASK;
 
-	/* M1 spike (2026-05-19 fix):single_stream 模式只改 NEWMA pool feeding
-	 * (qp_idx / path_idx),保留 saps_submit_slot(cid, qp_idx_real, path_idx_real)
-	 * 用 real qp/path 做 cid disambiguation。原本錯誤:remap 後不同 qp 的 cid
-	 * 撞同一 slot → submit_tsc 被覆寫 → complete delta_ticks garbage → NEWMA
-	 * 餵錯訊號永遠不 fire(本輪 testbed 抓到的 bug)。 */
 	uint16_t qp_idx = qp_idx_real;
 	uint16_t path_idx = path_idx_real;
 	if (s->saps_m1_single_stream) {
@@ -5053,10 +4865,8 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
 	}
 
 	if (kind == 0) {
-		/* submit — record submit tsc;用 real qp/path 做 slot disambiguation */
 		g_submit_tsc_low[saps_submit_slot(cid, qp_idx_real,
 						   path_idx_real)] = (uint32_t)tsc_low;
-		/* S3 SAPS: per-path inflight tracking (NEWMA pool 看 remap 後) */
 		saps_update(s, qp_idx, path_idx, 0, e, 0);
 		/* SAPS-Q M-series: per-tenant submit counter for demand EWMA.
 		 * tenant_id = qp_id & M3_TENANT_MASK (matches M3/M4 convention).
@@ -5090,11 +4900,6 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
 	/* S3 SAPS: per-path Welford + CUSUM + scoring + verdict write. */
 	saps_update(s, qp_idx, path_idx, 1, e, delta_ticks);
 
-	/* M2 spike (2026-05-19): per-client streaming PCA (Oja's rule)。
-	 * 對應 specs/m2-dpa-implementation-plan-20260519.md §2/§3。
-	 * 跑在 saps_update 之後讓 p->ewma_fast / p->ewma_slow / p->err_rate_ewma
-	 * / p->inflight 都已 update。Sub-sample 1/8 + env var gate 都在
-	 * m2_oja_update() 內部處理。 */
 	if (s->saps_m2_enabled) {
 		struct dpa_path_state *p_m2 = &g_path[qp_idx][path_idx];
 		uint16_t client_id = (qp & DPA_PLUGIN_CONN_MASK) & M2_CLIENT_MASK;
@@ -5115,13 +4920,6 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
 		m2_oja_update(s, client_id, x);
 	}
 
-	/* M3 WMM credit ledger (2026-05-20 v2): per-tenant credit refresh + decrement
-	 * + admission gate。對應 specs/m3-dpa-implementation-plan-20260519.md §2。
-	 * v1 (m3_v2_admission_gate=0):純 observability,credit < 0 只增 counter。
-	 * v2 (m3_v2_admission_gate=1):credit 不夠時把 tenant 對應的 per_qp_tokens
-	 * 凍結成 0,host fast-path 自然 throttle。當 credit 再充回正,下次 IO 進來
-	 * m3_consume 成功會更新 served counter(token 不主動 unfreeze,host 端
-	 * cumulative-credit 機制會在 admit 後自然 unfreeze)。 */
 	if (s->m3_enabled) {
 		uint32_t tenant_id;
 		if (s->m3_my_tenant_id != 0xFFFFFFFFu) {
@@ -5132,13 +4930,6 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
 		m3_refresh_credit(s, tenant_id, tsc_low);
 		bool admitted = m3_consume(s, tenant_id);
 
-		/* M3 v2 (2026-05-20, M4 namespace):token bucket。
-		 *
-		 * Architectural decision (testbed iteration 1):enforcement moved to
-		 * host fast-path (dpa_plugin.c admission_check),因為 pure-DPA
-		 * refresh 會 deadlock — completions 停 → process_event 停 → refresh
-		 * 停 → reject 永遠 stuck。 DPA-side 保留 observability hook (counter
-		 * 增量) 但不負責 admission decision。 */
 		if (s->m4_v2_enabled) {
 			uint32_t m4_tid = (s->m4_my_tenant_id != 0xFFFFFFFFu)
 				? (s->m4_my_tenant_id & M3_TENANT_MASK)
@@ -5147,14 +4938,9 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
 			(void)m4_refresh_and_consume;
 		}
 
-		/* v3 (2026-05-20):用獨立 m3_tenant_freeze[] 直接 hard-block。
-		 * v3-A2 sticky:m3_consume() return false 時設 freeze=1(sticky)。
-		 * Unfreeze 由 m3_refresh_credit() 在 credit ≥ 16 IO 水位時做,讓 host
-		 * fast-path 有時間 sees freeze=1 sticky 而不是 per-IO 翻轉。 */
 		if (s->m3_v3_freeze_gate && !admitted) {
 			s->m3_tenant_freeze[tenant_id] = 1;
 		} else if (!admitted && s->m3_v2_admission_gate) {
-			/* v2 legacy 路線(已知 wrap issue,留 backward compat) */
 			for (uint32_t qp_iter = tenant_id;
 			     qp_iter < DPA_PLUGIN_CONN_MAX;
 			     qp_iter += M3_TENANT_MAX) {
@@ -5209,50 +4995,6 @@ static inline void process_event(volatile struct dpa_plugin_shared *s,
  * accumulated credit gap would exceed max_tokens), we clamp the credit to
  * host_admitted + max_tokens — i.e. tokens not-yet-consumed expire if the
  * host wasn't there to use them. This is the classic leaky-bucket bound.
- */
-/* ── M5 v3 DPA-side proactive DRR scheduler (2026-05-20) ───────────────────
- *
- * Time-driven DRR round: called once per outer iteration.
- * DRR 輸出 = per-tenant grant_count (monotonic uint64)。
- * Host admission_check 讀 grant_count > consumed_count → atomic++ consumed → admit。
- *
- * Work-conserving 設計:
- *   - idle tenant (m5_tenant_pending[t] == 0):deficit 仍累積(clamp to 2×quantum)
- *     下輪 active 時可立刻多發 grant,符合 DRR work-conserving 定理。
- *   - active tenant:deficit += quantum,每 cost_per_io 發一個 grant,
- *     最多發 min(pending[t], deficit/cost) 個,避免 over-grant 超過 outstanding。
- *     deficit clamp [0, 2×quantum] 防止積欠無限。
- *
- * 時間觸發:elapsed_tsc ≥ m5_drr_interval_tsc (host init 設 1ms × tsc_freq)。
- * 避免 event-driven refresh deadlock (v2 §2 root cause)。
- *
- * O(M3_TENANT_MAX=16) 固定成本,不依賴 event 數。
- */
-/* ── SAPS-Q (2026-05-22): DPA-advised, host-enforced scheduler ────────────────
- *
- * Spec: specs/dm-research-redesign-20260522.md §4.2 (health-to-capacity) +
- *       §4.3 (weighted max-min progressive fill).
- *
- * Two phases per epoch:
- *   1. sapsq_compute_health(s)
- *      For each path p in 0..SAPSQ_PATH_MAX-1, aggregate (state, fault_type)
- *      across all QPs that have any score updates on that path, take the
- *      worst (highest severity) classification, map to health_factor_q16 +
- *      eligibility via the redesign §4.2 table。
- *   2. sapsq_allocate(s)
- *      Compute per-tenant rate r_i via weighted max-min progressive fill
- *      (active tenants sorted ascending by demand_i/w_i; unsaturated take
- *      their demand, saturated split remaining capacity by weight). Then
- *      split each r_i across paths proportional to C_p × E_p_indicator,
- *      flooring probe paths to sapsq_probe_rate_q32[p] and zero-ing
- *      quarantined paths.
- *
- * Anti-pattern banner: per_qp_path_capacity[] is post-admission-derived
- * (D8 self-reinforcing feedback). SAPS-Q uses only classifier state +
- * sapsq_path_base_iops_q32[] × sapsq_path_health_q16[].
- *
- * Complexity: O(T × P + T log T) per epoch — T=16, P=4 → ~256 ops.
- * No malloc, no FPU. Q-arith with uint64 intermediates throughout.
  */
 
 /* Per-path worst classification aggregate produced by sapsq_compute_health(). */

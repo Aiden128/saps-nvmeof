@@ -14,7 +14,6 @@ RPC="$SPDK/scripts/rpc.py"
 NQN="nqn.2024-01.io.spdk:mptest"
 UUID="12345678-1234-1234-1234-123456789012"
 # NGUID must also be identical across 3 tgt for SPDK multipath merge
-# (UUID alone不夠,SPDK 的 spdk_nvme_ns_cmp() 要 NGUID 也一致才接受為同一 bdev 的 path)
 NGUID="00000000000000001234567812345678"
 TARGET_IP="10.0.0.1"
 

@@ -3,27 +3,15 @@
 run_saps_q_e1_coordinator.py — SAPS static fairness via coordinator/tenant mode
 
 Root cause of standalone-mode failure (Lane B/H/I/J):
-  每個 bdevperf 進程各自持有獨立的 g_ctx.ring (posix_memalign),
-  SAPSQ_* 2D fields 變成 4 份 disjoint copy → multi-tenant 設計完全失效。
 
-Option X 修正路徑 (此 script 實作):
-  - tenant 0: DPA_PLUGIN_ROLE=coordinator — 執行完整 dpa_plugin_init()
     + alloc_ring_memfd() + UDS server + DPA FlexIO scheduler
-  - tenant 1/2/3: DPA_PLUGIN_ROLE=tenant — uds_client_get_memfd() attach 同一 memfd
     + SAPSQ_MY_TENANT_ID={1,2,3} → g_sapsq_local_tenant_id (per-process local)
-  共享同一 ring → 4 份 SAPSQ_* 2D fields 真正 cross-process shared state
-
-E4 per-process local tenant id 修正 (Lane K, dpa_plugin.c):
-  tenant 進程 attach 後讀 SAPSQ_MY_TENANT_ID env → g_sapsq_local_tenant_id,
-  admission_check() 優先用此值而非 ring->sapsq_my_tenant_id (coordinator 設的 tid=0)。
 
 PASS criteria:
   - per-tenant IOPS ≈ [100K, 33K, 33K, 33K] ± 15%
   - weighted Jain ≥ 0.95
   - total ≈ 200K
   - io_failed = 0
-  - sapsq_epoch_commit_seq > 0 (DPA scheduler 有 publish)
-  - sapsq_tenant_path_admit_count[t][p] 4×3=12 cells 全 non-zero
   - sapsq_stale_epoch_fallback / total_event < 10%
 """
 
@@ -39,8 +27,6 @@ import threading
 import time
 from pathlib import Path
 
-# ── 常數 ──────────────────────────────────────────────────────────────────────
-
 BDEVPERF = "/home/aiden/spdk/build/examples/bdevperf"
 RPCPY = "/home/aiden/spdk/scripts/rpc.py"
 BDEVPERF_PY = "/home/aiden/spdk/examples/bdev/bdevperf/bdevperf.py"
@@ -50,10 +36,6 @@ TARGET_RPC = "/home/aiden/spdk/scripts/rpc.py"
 DEFAULT_TARGET_RPC_SOCKET = "/var/tmp/spdk_saps_shared_ns.sock"
 TARGET_IP = "10.0.1.1"
 
-# 每 tenant 有 3 個 path: port = TENANT_BASE_PORT + tenant_id + PATH_PORT_OFFSETS[path_idx]
-# 新方案 (setup_arm1_sapsq_Nt3p.sh): base 4500/4600/4700, stride 100 between paths.
-# N=16: A 4500-4515, B 4600-4615, C 4700-4715 — 無重疊。
-# 舊 4t3p 腳本用 4430/4440/4450 + stride 10；已改用新腳本，此處同步。
 TENANT_BASE_PORT = 4500
 PATH_PORT_OFFSETS = [0, 100, 200]  # path A/B/C (stride 100, N≤99 safe)
 
@@ -67,7 +49,6 @@ BASE_CORE = 4
 CORES_PER_PROC = 2
 SOCK_TMPL = "/var/tmp/bdevperf_sapsq_proc{i}.sock"
 
-# UDS socket path — coordinator 監聽,tenant 連接
 DPA_PLUGIN_SOCK = "/tmp/dpa_plugin_e1.sock"
 DPA_PLUGIN_RING_SIZE = 1 << 16
 SAPSQ_DUMP = Path(__file__).resolve().parent / "sapsq_dump"
@@ -76,9 +57,6 @@ HEALTH_COUPLING_MODE_IDS = {
     "fixed": 1,
     "binary": 2,
 }
-
-
-# ── 工具函數 ─────────────────────────────────────────────────────────────────
 
 def ts_str():
     return time.strftime("%H:%M:%S")
@@ -483,7 +461,6 @@ def analyze_live_evidence(samples: list, errors: list, args) -> dict:
 
 
 def detect_tsc_hz() -> int:
-    """arm64 TSC 頻率偵測:讀 /proc/cpuinfo 的 CPU MHz。BF3 fallback 1 GHz。"""
     try:
         with open("/proc/cpuinfo") as f:
             for line in f:
@@ -682,9 +659,6 @@ def schedule_listener_delay(args, logfile):
     thread.start()
     return thread, errors
 
-
-# ── env var 組裝 ─────────────────────────────────────────────────────────────
-
 def build_env_coordinator(tenant_id: int, n_tenants: int, n_paths: int,
                            link_cap: int, weights: list, tsc_hz: int,
                            bypass_d: str, path_caps: list[int],
@@ -693,12 +667,7 @@ def build_env_coordinator(tenant_id: int, n_tenants: int, n_paths: int,
                            health_coupling_mode: str = "continuous") -> list:
     """
     Coordinator (tenant 0) env:
-      - DPA_PLUGIN_ROLE=coordinator → dpa_plugin_init() 完整 path
         (ibv_open_device + flexio_process_create + alloc_ring_memfd + UDS server)
-      - SAPSQ_ENABLED=1 + 完整 SAPSQ_* config → sapsq_m_init() 寫入 ring
-      - DPA_PLUGIN_SOCK=DPA_PLUGIN_SOCK → UDS 監聽路徑 (tenant 連這裡)
-      - SAPS_Q_ENABLED=0 → 關掉舊 1D sapsq_epoch_commit path
-      - HOST_SAPS_ENABLED=0 → 不能設 1,否則 host_saps.c 會 skip dpa_plugin_init()
     """
     return [
         f"DPA_PLUGIN_ROLE=coordinator",
@@ -710,7 +679,6 @@ def build_env_coordinator(tenant_id: int, n_tenants: int, n_paths: int,
         "HOST_SAPS_ENABLED=0",
         f"DPA_PLUGIN_SAMPLE_RATE={sample_rate}",
         "SAPS_TRACE=0",
-        # SAPS-Q M-series 2D path (新)
         "SAPSQ_ENABLED=1",
         f"SAPSQ_MY_TENANT_ID={tenant_id}",
         f"SAPSQ_NUM_TENANTS={n_tenants}",
@@ -736,9 +704,7 @@ def build_env_coordinator(tenant_id: int, n_tenants: int, n_paths: int,
         # Enabling ADMISSION=1 triggers E3 per-QP CUSUM which fires on
         # cold-start high-latency, blocking all IO before DPA can see any
         # events — a deadlock. SAPSQ 2D handles E1 rate limiting on its own.
-        # 舊 SAPS_Q_* 1D path 關閉
         "SAPS_Q_ENABLED=0",
-        # 其他路徑關閉
         "SAPS_M4_ENABLED=0",
         "SAPS_M5_DRR_ENABLED=0",
     ]
@@ -751,12 +717,7 @@ def build_env_tenant(tenant_id: int, n_tenants: int, n_paths: int,
     """
     Tenant (1/2/3) env:
       - DPA_PLUGIN_ROLE=tenant → uds_client_get_memfd() attach coordinator ring
-        不開 ibv device,不建 DPA process — 純 producer on shared ring
       - SAPSQ_MY_TENANT_ID={1,2,3} → g_sapsq_local_tenant_id (per-process local)
-        避免所有 tenant 讀 ring->sapsq_my_tenant_id (coordinator 設的 tid=0)
-      - SAPSQ_ENABLED=1 → admission_check 走 2D path (用 g_sapsq_local_tenant_id)
-      - SAPS_Q_ENABLED=0 → 關掉舊 1D path
-      - HOST_SAPS_ENABLED=0 → 不能設 1,否則 host_saps.c skip dpa_plugin_init()
     """
     return [
         f"DPA_PLUGIN_ROLE=tenant",
@@ -769,17 +730,11 @@ def build_env_tenant(tenant_id: int, n_tenants: int, n_paths: int,
         "HOST_SAPS_ENABLED=0",
         f"DPA_PLUGIN_SAMPLE_RATE={sample_rate}",
         "SAPS_TRACE=0",
-        # SAPS-Q M-series — tenant 不呼叫 sapsq_m_init(),只 attach ring
-        # SAPSQ_ENABLED=1 確保 admission_check 走 sapsq path
         "SAPSQ_ENABLED=1",
         f"SAPSQ_MY_TENANT_ID={tenant_id}",
-        # tenant 不需要 SAPSQ_NUM_TENANTS / SAPSQ_LINK_CAP_IOPS 等 (init 不執行)
-        # 但 SAPSQ_BYPASS_D_CLASSIFIER 傳給 ring 是 coordinator 的 SAPSQ_BYPASS_D_CLASSIFIER
-        # 此處設也無妨 (tenant path 不跑 sapsq_m_init)
         f"SAPSQ_BYPASS_D_CLASSIFIER={bypass_d}",
         f"SAPSQ_HEALTH_COUPLING_MODE={health_coupling_mode}",
         # DPA_PLUGIN_ADMISSION intentionally omitted (see coordinator comment above)
-        # 舊 1D path 關閉
         "SAPS_Q_ENABLED=0",
         "SAPS_M4_ENABLED=0",
         "SAPS_M5_DRR_ENABLED=0",
@@ -895,11 +850,7 @@ def assess_path_response(trace: dict, rate_budgets: dict, fault_path: int,
         "pass": passed,
     }
 
-
-# ── TenantProc 管理 ──────────────────────────────────────────────────────────
-
 class TenantProc:
-    """單一 bdevperf process (coordinator 或 tenant)。"""
 
     def __init__(self, tenant_id: int, is_coordinator: bool, args, out_dir: Path,
                  logfile, tsc_hz: int):
@@ -1159,11 +1110,6 @@ class TenantProc:
 # ── sapsq dump (coordinator ring snapshot) ───────────────────────────────────
 
 def read_sapsq_dump(out_dir: Path, procs: list, logfile) -> dict:
-    """
-    從 coordinator process 的 bdevperf log 抓 SAPS-Q exit stats。
-    coordinator 在 dpa_plugin_shutdown() 時印 per-tenant/path admit/reject/rate。
-    同時讀 dpa_plugin_ring memfd 透過 /proc/<pid>/fd (若 coordinator 還活著)。
-    """
     coord_proc = next((p for p in procs if p.is_coordinator), None)
     if not coord_proc:
         return {}
@@ -1186,8 +1132,6 @@ def read_sapsq_dump(out_dir: Path, procs: list, logfile) -> dict:
         "health_coupling_mode": None,
     }
 
-    # 從 coordinator log 解析 SAPS-Q exit stats
-    # dpa_plugin.c 在 shutdown 時印:
     #   "dpa_plugin: SAPS-Q exit stats my_tid=N stale_epoch_fallback=X ..."
     m = re.search(r"stale_epoch_fallback=(\d+)", content)
     if m:
@@ -1197,7 +1141,6 @@ def read_sapsq_dump(out_dir: Path, procs: list, logfile) -> dict:
     if m:
         dump["health_coupling_mode"] = int(m.group(1))
 
-    # epoch_commit_seq 從 DPA scheduler tick log (若有)
     m = re.search(r"epoch_commit_seq[=:](\d+)", content)
     if m:
         dump["sapsq_epoch_commit_seq"] = int(m.group(1))
@@ -1280,13 +1223,8 @@ def read_sapsq_dump(out_dir: Path, procs: list, logfile) -> dict:
     log(f"sapsq dump → {dump_path}", logfile)
     return dump
 
-
-# ── Jain 指數計算 ─────────────────────────────────────────────────────────────
-
 def weighted_jain(iops_list: list, weights: list) -> float:
     """
-    加權 Jain index:
-      - 每 tenant 的 share_ratio = iops[t] / (weight[t] / sum_w × link_cap)
       - weighted_jain = (Σ share_ratio)² / (N × Σ share_ratio²)
     """
     n = len(iops_list)
@@ -1782,7 +1720,6 @@ def main():
             log(f"[TARGET_DELAY] final cleanup failed: {error}", orch_log)
 
     # ── Step 8: graceful shutdown ─────────────────────────────────────────────
-    # 先送 SIGTERM 給所有 proc，讓 dpa_plugin_shutdown() 有機會執行並 print exit stats
     log("graceful shutdown: sending SIGTERM to all procs", orch_log)
     for p in procs:
         if p.proc:
@@ -1791,7 +1728,6 @@ def main():
                                capture_output=True)
             except Exception:
                 pass
-    # 等 5s 讓 coordinator dpa_plugin_shutdown() 執行並 flush log
     time.sleep(5)
 
     # Read sapsq dump BEFORE killing processes (exit stats in logs)

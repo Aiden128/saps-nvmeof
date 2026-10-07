@@ -341,10 +341,6 @@ void dpa_plugin_ctrlr_release(const void *ctrlr);
  */
 void dpa_plugin_prefetch_path_score_row(uint16_t qp_id);
 
-/* M2 v2 host classifier (2026-05-20):exposed for unit test program。Reads
- * ring->m2_pca_conf_q16[16] and writes ring->per_client_joint_verdict[16] +
- * stderr [M2_VERDICT] log。Production code 透過 m2_classifier_fn pthread 每
- * 10ms 自動呼叫;test program 直接呼叫驗演算法。 */
 struct dpa_plugin_shared;
 void host_m2_classifier_tick(struct dpa_plugin_shared *ring);
 

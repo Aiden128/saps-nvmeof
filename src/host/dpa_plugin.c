@@ -212,19 +212,10 @@ struct dpa_plugin_ctx {
 	volatile int                 sampler_stop;
 	FILE                        *sampler_file;
 
-	/* M2 v2 host-side joint-anomaly classifier (2026-05-20)。讀
-	 * ring->m2_pca_conf_q16[16] 算 entropy → 寫 ring->per_client_joint_verdict[16]。
-	 * 10ms tick,不在 hot path,純 observability。 */
 	pthread_t                    m2_cls_thread;
 	int                          m2_cls_started;
 	volatile int                 m2_cls_stop;
 
-	/* M3 v4 closed-loop snapshot dumper (2026-05-20)。
-	 * 每 100ms 把 per-tenant ledger state (iops_served / credits_q32 /
-	 * exhaust_count / last_tsc) JSON dump 到
-	 * `/tmp/m3_proc_{tenant_id}_snap.json`,給 host control daemon
-	 * 讀做 closed-loop feedback。SAPS_M3_SNAPSHOT=1 啟用,預設 0。
-	 * 用 stdlib pthread,不依賴 SPDK thread。 */
 	pthread_t                    m3_snap_thread;
 	int                          m3_snap_started;
 	volatile int                 m3_snap_stop;
@@ -352,23 +343,6 @@ static void *sampler_fn(void *arg)
 	return NULL;
 }
 
-/* ─── M2 v2 host-side joint-anomaly classifier (2026-05-20) ──────────────
- *
- * 對應 specs/m2-dpa-implementation-plan-20260519.md §3 + §4。DPA 端 Oja
- * update 寫 ring->m2_pca_conf_q16[c] = cosine(w_c, w_baseline) (Q16.16 signed)。
- * 此 thread 每 10ms tick 一次:
- *   1. 對 16 個 client 算 deviation L_c = 1.0 - conf_q16[c]/65536
- *   2. 跳過 warmup 未完成 (conf_q16 == 0) 與 noise floor (L_c < 0.05)
- *   3. 算 entropy H = -Σ p_c log2(p_c), p_c = L_c / Σ L_c
- *   4. 三分類 verdict 寫 ring->per_client_joint_verdict[c]:
- *        H ≥ 3.6  (≥ 0.9 × log2(16)) → JOINT (SHARED_FATE)
- *        H < 2.0                     → INDIVIDUAL (K=1 pattern)
- *        2.0 ≤ H < 3.6               → SUSPECT,經 N_SUSPECT_CONFIRM
- *                                       連續 tick 仍邊界才升 JOINT
- *
- * 純 observability:per_client_joint_verdict[] 沒人讀,paper §6 只用 stderr
- * log [M2_VERDICT] grep 拿 detection latency。 */
-
 #define HOST_M2_CLIENT_MAX        16
 #define HOST_M2_NOISE_FLOOR_Q16   3277       /* 0.05 in Q16.16 */
 #define HOST_M2_H_JOINT_Q16       235930     /* 3.6 in Q16.16 (0.9 × log2(16)) */
@@ -434,12 +408,9 @@ static inline int64_t host_m2_log2_q16(int64_t x_q16)
 	return int_part + frac_part;
 }
 
-/* Per-client SUSPECT hysteresis counter,thread-local 給 classifier 用。 */
 static uint32_t g_host_m2_suspect_count[HOST_M2_CLIENT_MAX];
-/* Previous verdict — 用來偵測 verdict 變化以 print log。 */
 static uint8_t  g_host_m2_prev_verdict[HOST_M2_CLIENT_MAX];
 
-/* monotonic ms wall-clock,給 log timestamp。 */
 static inline uint64_t host_m2_now_ms(void)
 {
 	struct timespec ts;
@@ -447,14 +418,11 @@ static inline uint64_t host_m2_now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000ull);
 }
 
-/* 跑一次 classifier tick。寫 ring->per_client_joint_verdict[]。
- * Non-static 給 unit test program 直接呼叫驗演算法。 */
 void host_m2_classifier_tick(struct dpa_plugin_shared *ring)
 {
 	if (!ring || !ring->saps_m2_enabled || !ring->m2_v2_classifier)
 		return;
 
-	/* Snapshot all 16 conf_q16,並算 L_c。Skip warmup (conf==0) 與 noise. */
 	int64_t L_q16[HOST_M2_CLIENT_MAX] = {0};
 	int     active[HOST_M2_CLIENT_MAX] = {0};
 	int     n_active = 0;
@@ -463,7 +431,6 @@ void host_m2_classifier_tick(struct dpa_plugin_shared *ring)
 	for (int c = 0; c < HOST_M2_CLIENT_MAX; c++) {
 		int32_t conf = ring->m2_pca_conf_q16[c];
 		if (conf == 0) {
-			/* warmup 未完成,verdict 維持 UNSET */
 			g_host_m2_suspect_count[c] = 0;
 			if (g_host_m2_prev_verdict[c] != DPA_M2_VERDICT_UNSET) {
 				ring->per_client_joint_verdict[c] = DPA_M2_VERDICT_UNSET;
@@ -471,7 +438,6 @@ void host_m2_classifier_tick(struct dpa_plugin_shared *ring)
 			}
 			continue;
 		}
-		/* clip 到 [-65536, 65536] 避免異常溢位 */
 		int64_t c_q16 = conf;
 		if (c_q16 >  65536) c_q16 =  65536;
 		if (c_q16 < -65536) c_q16 = -65536;
@@ -486,11 +452,10 @@ void host_m2_classifier_tick(struct dpa_plugin_shared *ring)
 		}
 	}
 
-	/* 若無 active client,全寫 HEALTHY 並清 suspect counter。 */
 	if (n_active == 0 || sum_L_q16 <= 0) {
 		for (int c = 0; c < HOST_M2_CLIENT_MAX; c++) {
 			int32_t conf = ring->m2_pca_conf_q16[c];
-			if (conf == 0) continue;  /* 仍 warmup */
+			if (conf == 0) continue;   
 			g_host_m2_suspect_count[c] = 0;
 			uint8_t v = DPA_M2_VERDICT_HEALTHY;
 			if (g_host_m2_prev_verdict[c] != v) {
@@ -520,8 +485,6 @@ void host_m2_classifier_tick(struct dpa_plugin_shared *ring)
 	}
 	if (H_q16 < 0) H_q16 = 0;
 
-	/* 三分類。SUSPECT hysteresis:邊界區 H ∈ [H_LOW, H_JOINT) 累積 confirm
-	 * count,連續 ≥ N_SUSPECT_CONFIRM tick 才升 JOINT。其他狀態立刻 clear count. */
 	uint8_t bulk_verdict;
 	int     bulk_is_boundary = 0;
 	if (H_q16 >= HOST_M2_H_JOINT_Q16) {
@@ -533,8 +496,6 @@ void host_m2_classifier_tick(struct dpa_plugin_shared *ring)
 		bulk_verdict = DPA_M2_VERDICT_INDIVIDUAL;
 	}
 
-	/* 把 bulk verdict apply 到每個 active client。INDIVIDUAL 場景:只標
-	 * dominant client (L_c 最大),其他 active client 保持/降回 HEALTHY。 */
 	int dominant_c = -1;
 	int64_t dominant_L = -1;
 	if (bulk_verdict == DPA_M2_VERDICT_INDIVIDUAL) {
@@ -577,7 +538,6 @@ void host_m2_classifier_tick(struct dpa_plugin_shared *ring)
 
 		if (v != g_host_m2_prev_verdict[c]) {
 			ring->per_client_joint_verdict[c] = v;
-			/* H 用 Q16.16 印小數三位:H = H_q16 / 65536 */
 			int H_int = (int)(H_q16 >> 16);
 			int H_frac = (int)(((H_q16 & 0xFFFF) * 1000ll) >> 16);
 			fprintf(stderr,
@@ -605,22 +565,6 @@ static void *m2_classifier_fn(void *arg)
 	return NULL;
 }
 
-/* M3 v4 closed-loop snapshot dumper (2026-05-20)。
- *
- * 對應 specs/m3-v4-closed-loop-snapshot-impl-20260520.md。
- *
- * 每 100 ms 從 shared ring 讀此 proc 自己的 tenant ledger
- * (m3_tenant_iops_served / m3_tenant_credits_q32 / m3_credit_exhaust_count /
- * m3_tenant_last_tsc),JSON dump 到 /tmp/m3_proc_{tid}_snap.json。
- * Host control daemon (m3_v4_control_daemon.py) 讀檔做 closed-loop
- * feedback (取代 open-loop weight × link_iops 推估)。
- *
- * Atomic write protocol:write 到 "{path}.tmp" 然後 rename 到 path,
- * 確保 reader (daemon) 永遠不會讀到 half-written file。
- *
- * 此 thread 不在 hot path (純 observability),完全 stdlib (pthread_create
- * + nanosleep + fprintf + rename),不依賴 SPDK thread。
- */
 static void *m3_snapshot_fn(void *arg)
 {
 	struct dpa_plugin_ctx *c = arg;
@@ -649,8 +593,6 @@ static void *m3_snapshot_fn(void *arg)
 		uint32_t m4_tokens = c->ring->m4_tenant_tokens_q16[tid];
 		uint32_t m4_rflag  = c->ring->m4_tenant_reject_flag[tid];
 
-		/* timestamp from CLOCK_REALTIME ms — daemon is_stale() 用
-		 * time.time()*1000 (wall-clock epoch ms),必須同一時鐘。 */
 		struct timespec now;
 		clock_gettime(CLOCK_REALTIME, &now);
 		uint64_t ts_ms = (uint64_t)now.tv_sec * 1000ULL
@@ -683,9 +625,7 @@ static void *m3_snapshot_fn(void *arg)
 			m4_tokens,
 			m4_rflag);
 		fclose(fp);
-		/* Atomic publish:rename = single inode swap,reader 不會見 partial */
 		if (rename(tmp_path, c->m3_snap_path) != 0) {
-			/* 同 file system 不該失敗,但記 errno 給 debug */
 			fprintf(stderr, "dpa_plugin: m3 snapshot rename(%s) failed: %s\n",
 				c->m3_snap_path, strerror(errno));
 		}
@@ -693,21 +633,12 @@ static void *m3_snapshot_fn(void *arg)
 	return NULL;
 }
 
-/* 啟動 M3 snapshot dumper:讀 SAPS_M3_SNAPSHOT env(預設 off),決定
- * tenant_id 來源(SAPS_M3_TENANT_ID env 或 ring->m3_my_tenant_id),
- * 設定 snapshot file path,spawn pthread。
- *
- * 此 helper 同時被 coordinator/standalone init 跟 tenant attach 呼叫,
- * 確保 multi-proc bdevperf 每個 proc 都有自己的 snapshot file。
- */
 static void m3_snapshot_maybe_start(struct dpa_plugin_ctx *c)
 {
 	const char *snap_env = getenv("SAPS_M3_SNAPSHOT");
 	if (!(snap_env && snap_env[0] == '1'))
-		return;   /* 預設 off,backward compat — 不 spawn thread */
+		return;    
 
-	/* 決定 tenant id:env override 優先(per-proc orchestrator 設),
-	 * fallback 用 ring->m3_my_tenant_id(coordinator init 寫入)。 */
 	uint32_t tid = 0xFFFFFFFFu;
 	const char *tid_env = getenv("SAPS_M3_TENANT_ID");
 	if (tid_env && tid_env[0]) {
@@ -738,7 +669,6 @@ static void m3_snapshot_maybe_start(struct dpa_plugin_ctx *c)
 		tid, c->m3_snap_path);
 }
 
-/* Stop + join snapshot thread,unlink snapshot file。idempotent。 */
 static void m3_snapshot_stop(struct dpa_plugin_ctx *c)
 {
 	if (!c->m3_snap_started)
@@ -748,7 +678,6 @@ static void m3_snapshot_stop(struct dpa_plugin_ctx *c)
 	c->m3_snap_started = 0;
 	if (c->m3_snap_path[0]) {
 		unlink(c->m3_snap_path);
-		/* unlink tmp 殘留(若 rename 之前 thread 被 join cut off) */
 		char tmp_path[160];
 		snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", c->m3_snap_path);
 		unlink(tmp_path);
@@ -1085,8 +1014,6 @@ static int open_ibv_dev(struct dpa_plugin_ctx *c, const char *devname)
 	return 0;
 }
 
-/* Q16.16 unit constant: 1 IO 在 Q16.16 fixed-point 表示為 65536。
- * Declared here (before sapsq_init_shared) so Fix 3 cold-start seed compiles. */
 #define SAPSQ_Q16_ONE  ((uint32_t)(1u << 16))
 
 /* sapsq_init_shared — zero-initialize all SAPS-Q M-series §5.1 fields.
@@ -1156,30 +1083,11 @@ static void sapsq_init_shared(struct dpa_plugin_shared *com)
 	}
 }
 
-/* ── Slice 3 SAPS-Q M-series host enforcement plane (2026-05-27) ─────────────
- *
- * 三個 static helper 函式 + sapsq_m_init() 實作 spec §4.4 host enforcement。
- * 對應 specs/research-architecture-consolidated-20260522.md §3.2 / §5.3 和
- * specs/dm-research-redesign-20260522.md §4.4。
- *
- * sapsq_read_stable_epoch():   讀取 epoch_seq/commit_seq 雙-seq stable-epoch protocol
- * sapsq_refresh_and_consume(): Q16.16 token bucket refresh + consume for (t,p)
- * sapsq_admission_check_2d():  enforce the budget of the selected path
- * sapsq_m_init():              讀 SAPSQ_* env,初始化 M-series 欄位
- *
- * 命名前綴全用 sapsq_ 避免與既有 m4_/m5_ 衝突。
- * sapsq_enabled=0 時所有函式均 dormant(caller 不呼叫)。
- */
-
-/* Sentinel return from sapsq_admission_check_2d:通知 caller 落 M4 fallback。
- * 用 -EOPNOTSUPP 作為 out-of-band sentinel,不會與 -EAGAIN(reject) 混淆。 */
 #define SAPSQ_ADMIT_STALE_FALLBACK  (-EOPNOTSUPP)
 
 /* QUARANTINED health level (per dpa_plugin_com.h comment: 6=QUARANTINED). */
 #define SAPSQ_HEALTH_QUARANTINED_VAL  6u
 
-/* sapsq_host_now_tsc: 讀 aarch64 virtual counter (cntvct_el0)。
- * 與現有 M4 / SAPS-Q 路徑用相同 counter,保持時鐘一致性。 */
 static inline uint64_t sapsq_host_now_tsc(void)
 {
 	uint64_t v;
@@ -1203,24 +1111,6 @@ static inline void sapsq_publish_offered_attempt(
 	g_sapsq_offered_pending = 0;
 }
 
-/* sapsq_read_stable_epoch: 讀取 sapsq_epoch_seq / sapsq_epoch_commit_seq 雙-seq
- * protocol,確保 rates_snapshot 是 DPA scheduler 完整提交的 epoch。
- *
- * Protocol (對稱 sapsq_publish_budgets on DPA-side):
- *   1. acquire-load epoch_commit_seq  (e1)
- *   2. compiler barrier
- *   3. copy rates_snapshot from sapsq_tenant_path_rate_budget_q32
- *   4. compiler barrier
- *   5. acquire-load epoch_seq         (e2)
- *   6. e1 == e2 → snapshot 一致;否則 DPA 在步驟 3 期間進行了 update,retry。
- *
- * 成功 → true,*out_epoch = epoch 值。
- * 4 次都失敗(DPA 持續 in-flight) → false → caller 用 fallback。
- *
- * 記憶體開銷:rates_snapshot 16×8×4 = 512 B。在 SPDK fast-path 呼叫,
- * 但每次 admission_check 只做一次 memcpy。若 future profiling 顯示 > 50ns
- * overhead,可改成 lazy per-row copy(每次只複製 tenant_id 那 row = 8×4=32B)。
- */
 /* Last-good budget cache (E2 cap-binding fix, 2026-05-29).
  * The DPA's publish_budgets holds epoch_seq != epoch_commit_seq for the whole
  * rate-table write + two ~600 us window-writebacks.  A host read landing in
@@ -1361,21 +1251,6 @@ uint32_t dpa_plugin_read_sapsq_probe_rate_q32(void)
 		__ATOMIC_ACQUIRE);
 }
 
-/* sapsq_refresh_and_consume: Q16.16 token bucket refresh + consume for (t,p)。
- *
- * 公式:
- *   dt_tsc        = now_tsc - last_refresh_tsc (clamped to M3_DELTA_TSC_CAP)
- *   refill_q16    = (rate_q32 × dt_tsc) >> 16   (rate IO/tsc × tsc = IO, Q16.16)
- *   burst_cap_q16 = rate_q32 / 10               (≈100ms worth,最多不超過)
- *   tokens        = min(tokens + refill_q16, burst_cap_q16)
- *   if tokens >= Q16_ONE: tokens -= Q16_ONE; ADMIT
- *   else:                 REJECT
- *
- * Race 說明:SPDK per-qpair 是 single-thread,M3-v2 既有 assumption = single-process
- * per-tenant。同 (t,p) 不會 cross-thread。函式不需 atomic CAS(與 M4 一致)。
- *
- * 返回 0 = ADMIT,-EAGAIN = REJECT。
- */
 static inline int sapsq_refresh_and_consume_m(
 	struct dpa_plugin_shared *com,
 	uint32_t t, uint32_t p,
@@ -1423,13 +1298,6 @@ static inline int sapsq_refresh_and_consume_m(
 	if (tokens > 0xFFFFFFFFULL)
 		tokens = 0xFFFFFFFFULL;
 
-	/* 更新 TSC — 只在 dt_tsc > 0(refill 確實算過)或 cold-start(last_tsc==0,
-	 * 必須 seed anchor)時推進 anchor。
-	 * Bug fix: 在 line-rate 下多筆 consume 可能讀到相同的 now_tsc
-	 * (host TSC 來源粒度),此時 dt_tsc==0、refill==0。若仍把 anchor
-	 * 覆寫成 now_tsc,會把 last_tsc 到下一個真正前進的 now_tsc 之間的
-	 * 子粒度時間丟掉 → refill 永遠補不回來 → 在 line rate 下發出假性
-	 * -EAGAIN。保留舊 anchor,讓下次 dt_tsc 涵蓋完整經過時間。 */
 	if (dt_tsc > 0 || last_tsc == 0)
 		com->sapsq_tenant_path_refresh_tsc[t][p] = now_tsc;
 
@@ -1449,19 +1317,6 @@ static inline int sapsq_refresh_and_consume_m(
 	return -EAGAIN;  /* REJECT */
 }
 
-/* sapsq_admission_check_2d: enforce the committed budget for the path selected
- * by SPDK before the RDMA submission hook runs.
- *
- * The admission hook receives an already-selected qpair. It can delay that
- * submission, but it cannot redirect it to another qpair. Token accounting
- * must therefore use the qpair's physical path. Consuming another path's token
- * here would make the budget table disagree with the path that carries the IO.
- *
- * 返回:
- *   0                          — ADMIT
- *   SAPSQ_ADMIT_STALE_FALLBACK — epoch 尚未就緒(cold-start),caller 走 M4
- *   -EAGAIN                    — selected path has no token, retry through SPDK
- */
 static int sapsq_admission_check_2d(
 	struct dpa_plugin_shared *com,
 	uint32_t tenant_id,
@@ -1474,8 +1329,6 @@ static int sapsq_admission_check_2d(
 	 * an active tenant appear idle to the next HCAA epoch. */
 	sapsq_publish_offered_attempt(com, tenant_id);
 
-	/* Step 1: stable-epoch read。讀失敗(DPA 持續 in-flight)→ fallback。
-	 * epoch_commit_seq == 0 代表 DPA scheduler 尚未執行過任何 tick → cold-start。 */
 	uint32_t epoch;
 	uint32_t row[SAPSQ_MAX_PATHS];
 
@@ -1537,28 +1390,12 @@ static int sapsq_admission_check_2d(
 	return rc;
 }
 
-/* sapsq_m_init: 初始化 SAPS-Q M-series 欄位,讀 SAPSQ_* env vars。
- *
- * 與現有 SAPS_Q_* 路徑(舊 4-path 欄位 sapsq_tenant_path_rate_q32)並存:
- *   - SAPS_Q_ENABLED=1 → 舊路徑(sapsq_epoch_commit 單-seq,舊 token bucket)
- *   - SAPSQ_ENABLED=1  → 新 M-series 路徑(epoch_seq/commit_seq 雙-seq,新 2D table)
- *   - 兩者可同時不啟用(sapsq_enabled=0 → dormant)
- *
- * 若 SAPSQ_ENABLED=1,此函式覆寫 sapsq_enabled=1 並設定:
- *   sapsq_num_tenants, sapsq_num_paths, sapsq_link_cap_iops,
- *   sapsq_epoch_period_us, sapsq_tenant_weight[T], sapsq_probe_rate_budget_q32,
- *   sapsq_host_tsc_freq, sapsq_my_tenant_id (via SAPSQ_MY_TENANT_ID env)。
- *
- * DPA scheduler tick 需要 sapsq_host_tsc_freq 做 period 計算;若 SAPSQ_HOST_TSC_FREQ
- * 未設,直接從 cntfrq_el0 讀取(與 M4/M5 一致)。
- */
 static void sapsq_m_init(struct dpa_plugin_shared *com)
 {
 	const char *en_env = getenv("SAPSQ_ENABLED");
 	if (!(en_env && en_env[0] == '1'))
-		return;  /* SAPSQ_ENABLED 未設或非 1 → dormant,不覆寫 sapsq_enabled */
+		return;   
 
-	/* tenant id — 每 proc 必設,否則 disable。 */
 	const char *tid_env = getenv("SAPSQ_MY_TENANT_ID");
 	uint32_t my_tid = (tid_env && tid_env[0]) ? (uint32_t)atoi(tid_env) : 0u;
 	if (my_tid >= SAPSQ_MAX_TENANTS) {
@@ -1659,15 +1496,10 @@ static void sapsq_m_init(struct dpa_plugin_shared *com)
 		n_w = (int)num_t;
 	}
 
-	/* probe_rate_budget_q32 — 從 IOPS 換算 Q0.32 IO/tsc。
-	 * 先讀 tsc_freq,再換算。
-	 * probe_rate_iops → probe_rate_q32 = round(probe_iops / tsc_freq × 2^32) */
 	const char *pf_env = getenv("SAPSQ_PROBE_RATE_IOPS");
 	uint64_t probe_iops = (pf_env && pf_env[0])
 			      ? strtoull(pf_env, NULL, 10) : 1000ULL;
 
-	/* tsc_freq — 若 SAPSQ_HOST_TSC_FREQ 有設則用,否則讀 cntfrq_el0。
-	 * DPA scheduler tick 讀 sapsq_host_tsc_freq 做 period 換算,必須一致。 */
 	const char *tf_env = getenv("SAPSQ_HOST_TSC_FREQ");
 	uint64_t tsc_freq;
 	if (tf_env && tf_env[0]) {
@@ -1680,12 +1512,9 @@ static void sapsq_m_init(struct dpa_plugin_shared *com)
 			tsc_freq = 1000000000ULL;
 	}
 
-	/* Q0.32 換算:probe_q32 = round(probe_iops / tsc_freq × 2^32)。
-	 * 與 M4 / 現有 SAPS_Q_PATH_BASE_IOPS_Q32 同公式。 */
 	uint32_t probe_rate_q32 = (uint32_t)(
 		(double)probe_iops / (double)tsc_freq * (double)(1ULL << 32));
 
-	/* 寫入 M-series 欄位 */
 	com->sapsq_my_tenant_id     = my_tid;
 	/* E4: also set process-local tenant id so coordinator process itself uses
 	 * the correct row in admission_check (same as tenant path). */
@@ -1931,8 +1760,6 @@ int dpa_plugin_init(void)
 				}
 			}
 		}
-		/* M3 v4 snapshot dumper:tenant proc 也要 dump 自己的 ledger,
-		 * 給 host control daemon 做 closed-loop feedback。 */
 		m3_snapshot_maybe_start(&g_ctx);
 		fprintf(stderr,
 			"dpa_plugin: tenant init ok (role=tenant sock=%s sample_rate=%u)\n",
@@ -2058,42 +1885,26 @@ int dpa_plugin_init(void)
 	memset((void *)g_ctx.ring->per_qp_path_retry_verdict, 0xFF,
 	       sizeof(g_ctx.ring->per_qp_path_retry_verdict));
 
-	/* M1 spike (2026-05-17): cross-stream NEWMA 模式開關。在 memset(g_ctx.ring)
-	 * 清零之後寫入,確保不會被 init 覆蓋。DPA 端 process_event() 讀此 bit
-	 * 決定要不要把 (qp_idx, path_idx) remap 到 (0, 0) 模擬跨 client 聚合。 */
 	{
 		const char *m1_env = getenv("SAPS_M1_SINGLE_STREAM");
 		uint32_t m1_single = (m1_env && m1_env[0] == '1') ? 1u : 0u;
 		g_ctx.ring->saps_m1_single_stream = m1_single;
-		/* M1 reset (2026-05-19):每次 init 都 request DPA 清 g_path[0][0],
-		 * 避免跨 testbed rep state 殘留;DPA 第一筆 event 處理後會 clear。 */
 		g_ctx.ring->saps_m1_reset_request = m1_single;
 		fprintf(stderr, "dpa_plugin: M1 single_stream=%u reset_request=%u\n",
 			m1_single, m1_single);
 	}
 	{
-		/* M2 spike (2026-05-19): per-client streaming PCA gate。
-		 * 預設 0(off),避免影響既有 D-series benchmark。
-		 * SAPS_M2_ENABLED=1 啟動 DPA 端 Oja's rule + cosine to baseline。
-		 * 對應 specs/m2-dpa-implementation-plan-20260519.md。 */
 		const char *m2_env = getenv("SAPS_M2_ENABLED");
 		uint32_t m2_on = (m2_env && m2_env[0] == '1') ? 1u : 0u;
 		g_ctx.ring->saps_m2_enabled = m2_on;
 		fprintf(stderr, "dpa_plugin: M2 enabled=%u\n", m2_on);
 
-		/* M2 v2 host classifier (2026-05-20):讀 DPA 寫的 m2_pca_conf_q16[]
-		 * 算 entropy 三分類 → 寫 ring->per_client_joint_verdict[]。
-		 * SAPS_M2_V2_CLASSIFIER=1 啟用,預設 0 保 backward compat。 */
 		const char *m2v2_env = getenv("SAPS_M2_V2_CLASSIFIER");
 		uint32_t m2v2_on = (m2v2_env && m2v2_env[0] == '1') ? 1u : 0u;
 		g_ctx.ring->m2_v2_classifier = m2v2_on;
 		fprintf(stderr, "dpa_plugin: M2 v2_classifier=%u\n", m2v2_on);
 	}
 	{
-		/* M3 spike (2026-05-19): per-tenant WMM credit ledger gate。
-		 * 對應 specs/m3-dpa-implementation-plan-20260519.md。預設 0(off)。
-		 * SAPS_M3_LINK_IOPS 設 link 容量(預設 200_000 對齊 spike);
-		 * 假設 TSC rate 1.5 GHz。cap_per_tsc_q32 = link_iops / tsc_rate × 2^32 */
 		const char *m3_env = getenv("SAPS_M3_ENABLED");
 		uint32_t m3_on = (m3_env && m3_env[0] == '1') ? 1u : 0u;
 		const char *m3_iops_env = getenv("SAPS_M3_LINK_IOPS");
@@ -2105,9 +1916,6 @@ int dpa_plugin_init(void)
 				link_iops = v;
 		}
 		uint64_t tsc_rate = 1500000000ULL;   /* 1.5 GHz BF3 hart */
-		/* Σw normalize:plan §2.1 DPA refresh = w_q16 × cap_per_tsc_q32 >> 16,
-		 * host 必須預先把 cap 除以 Σw_active(active tenant 數)。SAPS_M3_NUM_TENANTS
-		 * 預設 4 對齊 spike A/B/C/D。 */
 		const char *m3_nt_env = getenv("SAPS_M3_NUM_TENANTS");
 		uint64_t num_tenants_active = 4ULL;
 		if (m3_nt_env && m3_nt_env[0]) {
@@ -2121,17 +1929,12 @@ int dpa_plugin_init(void)
 		g_ctx.ring->m3_enabled = m3_on;
 		g_ctx.ring->m3_capacity_per_tsc_q32 = cap_q32;
 		g_ctx.ring->m3_credit_per_io_q32 = (int64_t)1 << 32;  /* 1.0 in Q32.32 */
-		/* M3 v2 (2026-05-20):SAPS_M3_V2_GATE=1 啟用 DPA-side admission gate。
-		 * credit < 0 時 DPA 把 per_qp_tokens[] 凍結成 0,host fast-path 自然
-		 * throttle 該 tenant。v1 為 observability only (gate=0)。 */
 		const char *m3v2 = getenv("SAPS_M3_V2_GATE");
 		g_ctx.ring->m3_v2_admission_gate = (m3v2 && m3v2[0] == '1') ? 1u : 0u;
 		const char *m3v3 = getenv("SAPS_M3_V3_GATE");
 		g_ctx.ring->m3_v3_freeze_gate = (m3v3 && m3v3[0] == '1') ? 1u : 0u;
 		for (uint32_t t = 0; t < 16; t++)
 			g_ctx.ring->m3_tenant_freeze[t] = 0;
-		/* M3 per-proc tenant id override:每 bdevperf proc 拿 unique tenant_id,
-		 * 避免 qp_id namespace 在 procs 間重複。0xFFFFFFFF = 不 override。 */
 		const char *m3_tid = getenv("SAPS_M3_TENANT_ID");
 		if (m3_tid && m3_tid[0]) {
 			g_ctx.ring->m3_my_tenant_id = (uint32_t)atoi(m3_tid);
@@ -2142,9 +1945,6 @@ int dpa_plugin_init(void)
 		}
 		for (uint32_t t = 0; t < 16; t++)
 			g_ctx.ring->m3_tenant_weights_q16[t] = 65536u;  /* default w=1.0 */
-		/* SAPS_M3_WEIGHTS env override:格式 "w0,w1,w2,..." (float),由 host
-		 * 端 normalize 並轉 Q16.16 寫進 shared struct。對應 spike scenario C
-		 * weight=[3,1,1,1] 等場景。 */
 		const char *w_env = getenv("SAPS_M3_WEIGHTS");
 		if (w_env && w_env[0]) {
 			double tw[16] = {0};
@@ -2174,21 +1974,6 @@ int dpa_plugin_init(void)
 	}
 
 	{
-		/* M3 v2 (M4 namespace, 2026-05-20):in-DPA per-tenant token bucket。
-		 * 對應 specs/m3-v2-in-dpa-enforcement-20260520.md。
-		 *
-		 * Env vars:
-		 *   SAPS_M4_ENABLED=1       啟用 (預設 0)
-		 *   SAPS_M4_LINK_IOPS       link 容量 IOPS (預設 200000)
-		 *   SAPS_M4_WEIGHTS         "w0,w1,w2,..." (float, 預設全 1)
-		 *   SAPS_M4_TENANT_ID       本 proc 的 tenant id (per-proc 必設)
-		 *   SAPS_M4_BURST_FACTOR    burst cap 多少 IO worth (預設 1000)
-		 *
-		 * Refresh rate: r_i = (w_i / Σw_active) × link_iops IOPS
-		 *   per-tsc Q16.16 = r_i / tsc_freq × 2^16
-		 * Burst cap Q16.16 = BURST_FACTOR × 2^16
-		 *
-		 * tsc_freq 對齊 M3:1.5 GHz BF3 hart。 */
 		const char *m4_env = getenv("SAPS_M4_ENABLED");
 		uint32_t m4_on = (m4_env && m4_env[0] == '1') ? 1u : 0u;
 
@@ -2201,9 +1986,6 @@ int dpa_plugin_init(void)
 				link_iops = v;
 		}
 
-		/* aarch64 host: cntvct_el0 freq from cntfrq_el0 (BF3 SoC ~1 GHz).
-		 * Used both for host fast-path refresh formulas AND for the
-		 * Q32 rate calculation。 */
 		uint64_t tsc_freq;
 		__asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(tsc_freq));
 		if (tsc_freq == 0)
@@ -2299,22 +2081,6 @@ int dpa_plugin_init(void)
 	}
 
 	{
-		/* M5 v3 DPA DRR scheduler (2026-05-20):Alt B proactive work-conserving
-		 * Deficit Round Robin。
-		 *
-		 * Env vars:
-		 *   SAPS_M5_DRR_ENABLED=1          啟用 (預設 0)
-		 *   SAPS_M5_LINK_IOPS              link 容量 IOPS (預設 200000)
-		 *   SAPS_M5_WEIGHTS                "w0,w1,..." (float,預設 "1,1,1,1")
-		 *   SAPS_M5_TENANT_ID              本 proc 的 tenant id (per-proc 必設)
-		 *   SAPS_M5_BASE_QUANTUM_IOS       每 round 每 unit weight 的 quantum (預設 1000)
-		 *   SAPS_M5_DRR_INTERVAL_US        DRR round 間隔 µs (預設 1000 = 1ms)
-		 *
-		 * quantum_q16[t] = round(w[t] / Σw × base_quantum_ios × (1<<16))
-		 * drr_interval_tsc = interval_us × tsc_freq / 1e6
-		 * cost_per_io_q16 = (1 << 16)  (1.0 IO per grant)
-		 *
-		 * tsc_freq: aarch64 cntfrq_el0 (BF3 SoC ~1 GHz) 同 M4。 */
 		const char *m5_env = getenv("SAPS_M5_DRR_ENABLED");
 		uint32_t m5_on = (m5_env && m5_env[0] == '1') ? 1u : 0u;
 
@@ -2441,26 +2207,6 @@ int dpa_plugin_init(void)
 	}
 
 	{
-		/* SAPS-Q (2026-05-22) — DPA-advised, host-enforced per-(tenant,path)
-		 * scheduler. Spec: specs/dm-research-redesign-20260522.md §4。
-		 *
-		 * DPA RP runs a weighted max-min allocator every epoch and publishes
-		 * sapsq_tenant_path_rate_q32[t][p] (Q32 IO/tsc) together with
-		 * sapsq_path_eligibility[p]. Host fast-path consumes the rates as a
-		 * per-(tenant,path) token bucket, with M4 as stale-epoch fallback.
-		 *
-		 * Env vars:
-		 *   SAPS_Q_ENABLED               master gate (default 0)
-		 *   SAPS_Q_MY_TENANT_ID          this proc's tenant id (0..SAPSQ_TENANT_MAX-1)
-		 *   SAPS_Q_EPOCH_INTERVAL_EVENTS DPA scheduler trigger (default 1024)
-		 *   SAPS_Q_EPOCH_STALE_US        host fallback threshold µs (default 50000;
-		 *                                Bug C 2026-05-24: was 1000, too tight vs ~14ms DPA cadence)
-		 *   SAPS_Q_WEIGHTS               "w0,w1,w2,w3" Q16.16 (default "65536,21845,21845,21845")
-		 *   SAPS_Q_DEMAND_Q32            "d0,d1,d2,d3" Q32 IO/tsc-equivalent (required when enabled)
-		 *   SAPS_Q_PATH_BASE_IOPS_Q32    "b0,b1,b2,b3" Q32 IO/tsc per-path base capacity (required)
-		 *   SAPS_Q_PROBE_RATE_Q32        "p0,p1,p2,p3" Q32 IO/tsc probe budget (default small)
-		 *
-		 * tsc_freq is aarch64 cntfrq_el0 — same as M4 / M5 above. */
 		const char *q_env = getenv("SAPS_Q_ENABLED");
 		uint32_t q_on = (q_env && q_env[0] == '1') ? 1u : 0u;
 
@@ -2855,8 +2601,6 @@ sapsq_init_done:
 		}
 	}
 
-	/* M3 v4 snapshot dumper:coordinator/standalone proc 也 dump 自己的 ledger
-	 * (standalone smoke 用此測試;coordinator 同時跑 IO 也視為一個 tenant)。 */
 	m3_snapshot_maybe_start(&g_ctx);
 
 	const char *role_str = (g_ctx.role == DPA_ROLE_COORDINATOR) ? "coordinator"
@@ -3353,23 +3097,6 @@ int dpa_plugin_admission_check(struct spdk_nvme_qpair *qpair, uint16_t qp_id,
 				g_ctx.ring ? (unsigned)g_ctx.ring->sapsq_enabled : 99u,
 				(unsigned)g_sapsq_local_tenant_id);
 	}
-	/* SAPS-Q (2026-05-22):DPA-advised per-(tenant,path) token bucket。
-	 * Spec: specs/dm-research-redesign-20260522.md §4.4。
-	 *
-	 * If SAPS-Q is enabled AND the published epoch is fresh, this branch is
-	 * the sole admission decision. If the epoch is stale (DPA scheduler did
-	 * not commit within sapsq_epoch_stale_us), fall through to M4 static
-	 * token bucket as substrate fallback.
-	 *
-	 * Path id derivation (2026-05-22 fix): use the host-side qpair→path_id
-	 * hashmap populated at qpair create with the listener-port-derived
-	 * slot. Fall back to (qp_id & DPA_PLUGIN_PATH_MASK) only when the
-	 * caller didn't register a qpair pointer (e.g. legacy smoke tests),
-	 * which keeps the prior behaviour for non-SAPS-Q callers but lets
-	 * 4-tenant × 3-path multipath land each (tid, pid) bucket correctly.
-	 *
-	 * Anti-deadlock invariant (redesign §4.4):token refresh is host-TSC
-	 * driven on every submit attempt, NEVER completion-driven。 */
 	if (g_ctx.ring && g_ctx.ring->sapsq_enabled) {
 		/* E4 coordinator/tenant: prefer process-local tenant id so each tenant
 		 * process uses its own 2D bucket row.  Fall back to ring->sapsq_my_tenant_id
@@ -3378,16 +3105,6 @@ int dpa_plugin_admission_check(struct spdk_nvme_qpair *qpair, uint16_t qp_id,
 				  ? g_sapsq_local_tenant_id
 				  : g_ctx.ring->sapsq_my_tenant_id;
 		if (my_tid < SAPSQ_TENANT_MAX) {
-			/* Slice 3 (2026-05-27): SAPS-Q M-series 2D enforcement。
-			 * sapsq_epoch_seq/commit_seq 雙-seq stable-epoch read +
-			 * selected-path budget enforcement。
-			 *
-			 * 若 sapsq_host_tsc_freq != 0(sapsq_m_init 已跑)且
-			 * epoch_commit_seq > 0(DPA scheduler 已發佈至少一個 epoch),
-			 * 走新 2D path。否則 fall through 到舊 sapsq_epoch_commit 路徑。
-			 *
-			 * path_id_hint: 同現有 path_id derivation 邏輯(qpair hashmap
-			 * 優先,fallback qp_id & PATH_MASK)。 */
 			if (g_ctx.ring->sapsq_host_tsc_freq != 0) {
 				uint16_t path_hint = dpa_plugin_path_id_of(qpair);
 				if (path_hint >= DPA_PLUGIN_PATH_MAX)
@@ -3606,29 +3323,10 @@ int dpa_plugin_admission_check(struct spdk_nvme_qpair *qpair, uint16_t qp_id,
 sapsq_fallthrough:;
 	}
 
-	/* M3 v2 (M4 namespace, 2026-05-20):host fast-path token bucket。
-	 *
-	 * Architectural learning (testbed 2026-05-20):純 DPA-side enforcement 會
-	 * deadlock — completion 停 → DPA process_event 停 → refresh 停 → reject
-	 * 永遠 stuck。 解法:把 refresh+consume 放在 host admission_check (每次
-	 * submit attempt 都會跑),DPA process_event 改成 pure observability
-	 * (m4_tenant_admit_count / reject_count) 給 paper §6 evidence。
-	 *
-	 * State (atomic via __atomic_*):
-	 *   m4_tenant_tokens_q16[tid]      — current tokens Q16.16
-	 *   m4_tenant_last_refresh_tsc[tid] — last refresh wall TSC
-	 *   m4_tenant_reject_flag[tid]     — observability (host writes)
-	 *
-	 * 必須在 g_admission_enabled / m3_v3_freeze 短路前,因為 M4 跟既有 E3 +
-	 * M3 v3 完全獨立。 */
 	if (g_ctx.ring && g_ctx.ring->m4_v2_enabled) {
 		uint32_t m4_tid = g_ctx.ring->m4_my_tenant_id;
 		if (m4_tid != 0xFFFFFFFFu) {
 			m4_tid &= 15u;
-			/* aarch64 virtual counter — plugin lib stays SPDK-API-free.
-			 * cntvct_el0 frequency 對齊 cntfrq_el0(BF3 SoC: 1 GHz);
-			 * 與 host init 用 1.5 GHz BF3 hart 假設不同,故 plugin init
-			 * 取 cntfrq_el0 重新算 rate_q32 在 M4 init 時。 */
 			uint64_t now_tsc;
 			__asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(now_tsc));
 			uint64_t last = __atomic_load_n(
@@ -3681,24 +3379,6 @@ sapsq_fallthrough:;
 		}
 	}
 
-	/* M5 v3 DPA DRR scheduler gate (2026-05-20):Alt B proactive scheduler。
-	 *
-	 * DPA RP 每 ~1ms 跑一輪 Deficit Round Robin,把 per-tenant grant_count
-	 * (monotonic uint64) 往上推。Host admission_check 比較:
-	 *   grant_count[t] > consumed_count[t] → admit (atomic++ consumed)
-	 *   grant_count[t] == consumed_count[t] → throttle (-EBUSY → SPDK queued_req)
-	 *
-	 * 同時 atomic++ m5_tenant_pending[t] 讓 DPA 知道 active tenant,
-	 * 實現 work-conserving: idle tenant 的 deficit 累積並留給下輪,
-	 * 活躍 tenant 可以借到更多 grant。
-	 *
-	 * 與 v2 差別 (paper §6 claim):
-	 *   v2: 每 proc 獨立 token bucket,no cross-tenant interaction,
-	 *       idle tenant share 浪費 (static rate cap)。
-	 *   v3: DPA DRR work-conserving,idle tenant deficit overflow to active,
-	 *       oversub 下 active tenant 拿到 >proportional share — 不浪費。
-	 *
-	 * 不需 winner ring / io_token / 改 hook signature (Alt B)。 */
 	if (g_ctx.ring && g_ctx.ring->m5_drr_enabled) {
 		/* Per-proc tenant id fix (2026-06-01): m5_my_tenant_id is a SINGLE
 		 * shared-ring field, so under the coordinator/tenant model (all procs
@@ -3734,10 +3414,6 @@ sapsq_fallthrough:;
 		}
 	}
 
-	/* M3 v3 freeze gate (2026-05-20):check per-tenant freeze flag set by DPA
-	 * when credit < 0。比 cumulative-credit gap 直接(後者 credit=0 wrap 不
-	 * throttle)。必須在 g_admission_enabled short-circuit 之前,因為 M3 v3
-	 * 跟 E3 admission 獨立。 */
 	if (g_ctx.ring && g_ctx.ring->m3_v3_freeze_gate) {
 		uint32_t my_tenant = g_ctx.ring->m3_my_tenant_id;
 		if (my_tenant != 0xFFFFFFFFu) {
@@ -4164,7 +3840,6 @@ void dpa_plugin_shutdown(void)
 
 	/* Tenant: only unmap + close memfd. Coordinator owns everything else. */
 	if (g_ctx.role == DPA_ROLE_TENANT) {
-		/* M3 snapshot dumper 先 stop;後面 munmap ring 會讓 thread 讀到 garbage */
 		m3_snapshot_stop(&g_ctx);
 		/* Bug C (2026-05-24): SAPS-Q exit stats — MUST be read BEFORE munmap. */
 		if (g_ctx.ring && g_ctx.ring->sapsq_enabled) {
@@ -4248,15 +3923,12 @@ void dpa_plugin_shutdown(void)
 		}
 	}
 
-	/* M2 v2 classifier thread join (2026-05-20)。stop flag 設 1 後等 10ms tick
-	 * 完成自然退出。 */
 	if (g_ctx.m2_cls_started) {
 		g_ctx.m2_cls_stop = 1;
 		pthread_join(g_ctx.m2_cls_thread, NULL);
 		g_ctx.m2_cls_started = 0;
 	}
 
-	/* M3 v4 snapshot dumper stop:在 ring 釋放前 join + unlink snapshot file。 */
 	m3_snapshot_stop(&g_ctx);
 
 	fprintf(stderr,

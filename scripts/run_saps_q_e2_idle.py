@@ -2,47 +2,18 @@
 """
 run_saps_q_e2_idle.py — SAPS-Q E2 work-conserving idle tenant orchestrator
 
-E2 設計(specs/dm-research-redesign-20260522.md §5 E2):
   4 tenants weight=[3,1,1,1], 3 paths, link_cap=200K IOPS
-  Phase 1 (t=0-20s) : 所有 4 tenants active → expected [100K, 33K, 33K, 33K]
-  Phase 2 (t=20-40s): tenant 1 idle → saps_q 應 redistribute → [120K, 0, 40K, 40K]
-  Phase 3 (t=40-60s): tenant 1 復工 → 應回到 [100K, 33K, 33K, 33K]
 
-比較組:
-  saps_q      — SAPSQ_ENABLED=1, 動態分配;work conservation 應讓 active 三人
-                充分利用 link_cap
   host_saps   — HOST_SAPS_ENABLED=1, DPA init disabled;host-side classifier
                 standalone per bdevperf process, no coordinator/tenant UDS ring
-  m3_v2_static — 舊 M4 host token bucket (static rates),沒 work conservation,
-                Phase 2 只剩 ~60% utilization
-  stock_qd     — 無 QoS,pure bdevperf saturation;用作 sanity baseline
 
-Idle 機制:
-  SIGSTOP/SIGCONT via os.kill()。
-  bdevperf 以 root 啟動故需 sudo kill;本 orchestrator 用
-  subprocess.run(["sudo","kill","-STOP",str(pid)]) 發送。
-
-  SIGSTOP 選擇理由:
-    - SIGSTOP pause → bdevperf IO 停止,DPA scheduler epoch 偵測 demand 下降
-    - 比 cgroup freeze (需 systemd cgroup v2 + root setup) 更輕量
-    - 比 taskset --cpu-list 99 更確定(bdevperf core 已 bind,mid-run taskset -p
       race condition)
-    - pending IO 在 SIGSTOP 期間被 RDMA NIC 緩衝;SIGCONT 後 bdevperf 繼續 inflight
 
-  Fallback 記錄(如果 SIGSTOP 在 bdevperf 上不 work):
-    症狀: bdevperf log 顯示 IO 繼續完成 / DPA 端 demand_iops[idle_tid] 沒降
-    備案 1: spdk RPC `bdev_set_qos_limit rw_ios_per_sec=0` on bdevperf local socket
-            → 限制 IO submission rate 到 0;恢復用 `bdev_set_qos_limit rw_ios_per_sec=-1`
-    備案 2: taskset -p <cpu_mask_invalid> <pid> 給 bdevperf 分配無 IO 的 CPU
-            (適合 SIGSTOP 因 ptrace 被 block 的情境)
-
-用法:
   python3 scripts/run_saps_q_e2_idle.py \\
       --mode saps_q --weights 3,1,1,1 --link-cap 200000 \\
       --idle-tenant 1 --idle-start 20 --idle-end 40 --duration 60 \\
       --output-dir experiments/sapsq/e2_idle_test/rep0
 
-  # dry-run(印 commands + envs,不跑 testbed):
   python3 scripts/run_saps_q_e2_idle.py \\
       --mode saps_q --dry-run \\
       --output-dir /tmp/e2_dry
@@ -64,8 +35,6 @@ import threading
 import time
 from pathlib import Path
 
-# ── 常數 ──────────────────────────────────────────────────────────────────────
-
 BDEVPERF = "/home/aiden/spdk/build/examples/bdevperf"
 RPCPY = "/home/aiden/spdk/scripts/rpc.py"
 BDEVPERF_PY = "/home/aiden/spdk/examples/bdev/bdevperf/bdevperf.py"
@@ -74,8 +43,6 @@ RAW_RPC = str(Path(__file__).with_name("spdk_rpc_raw.py"))
 NQN_PREFIX = "nqn.2024-01.io.spdk:tenant"
 TARGET_IP = "10.0.0.1"
 
-# 每 tenant 有 3 個 path:port = TENANT_BASE_PORT + tenant_id + PATH_PORT_OFFSETS[path_idx]
-# 新方案 (setup_arm1_sapsq_Nt3p.sh): base 4500/4600/4700, stride 100 between paths.
 TENANT_BASE_PORT = 4500
 PATH_PORT_OFFSETS = [0, 100, 200]   # path A/B/C (stride 100, N≤99 safe)
 
@@ -90,32 +57,19 @@ BASE_CORE = 4
 CORES_PER_PROC = 2
 SOCK_TMPL = "/var/tmp/bdevperf_sapsq_proc{i}.sock"
 
-# ── launch-race 防護常數 ───────────────────────────────────────────────────────
-# rep7 (N=10) 觀察到的 launch-race:perform_tests RPC 在啟動瞬間 (~3s) 即退出,
-# 不產任何 IO/result,但 orchestrator 仍把該 run 記成 complete 帶 None IOPS。
-# 偵測條件 (任一成立 → INVALID):
-#   (a) 任一 tenant parse 出的 IOPS 為 None 或 0
 #   (b) perform_tests phase wall-time < duration * MIN_WALLTIME_FRACTION
-#       (正常應跑滿 duration;<50% 代表 RPC 在 launch 即退出)
-# INVALID 時 tear down 整個 rep 並重跑,最多 MAX_RUN_ATTEMPTS 次。
-# 設 MAX_RUN_ATTEMPTS=1 即可完全還原舊行為 (不重試),故對既有 caller 相容。
-MAX_RUN_ATTEMPTS = 3            # 1 次正常 + 2 次重試
-MIN_WALLTIME_FRACTION = 0.5     # perform_tests wall-time 低於 duration*此值 → launch-race
+MAX_RUN_ATTEMPTS = 3            
+MIN_WALLTIME_FRACTION = 0.5     
 
-# UDS socket path — coordinator 監聽,tenant 連接 (與 e1_coordinator 共用路徑)
 DPA_PLUGIN_SOCK = "/tmp/dpa_plugin_e1.sock"
 ARM1_SSH_CONTROL = "/tmp/sapsq_arm1_rpc_%r_%h_%p"
 
-# Mode 名稱 mapping: 本 orchestrator CLI 名稱 → run_sapsq 內部 mode
 _MODE_MAP = {
     "saps_q":       "sapsq",
     "host_saps":    "host_saps",
     "m3_v2_static": "m4_static",
     "stock_qd":     "stock",
 }
-
-# ── 工具函數 ─────────────────────────────────────────────────────────────────
-
 
 def ts_str():
     return time.strftime("%H:%M:%S")
@@ -146,10 +100,6 @@ def raw_rpc_command(sock: str, method: str, params=None,
 
 
 def detect_tsc_hz() -> int:
-    """arm64 TSC 頻率偵測:讀 /proc/cpuinfo 的 CPU MHz 或 BogoMIPS 推算。
-    BF3 aarch64 cntfrq_el0 = 1 GHz;若讀不到 fallback 1e9。
-    host-side 無法直接 mrs cntfrq_el0,改讀 /proc/cpuinfo 的 CPU MHz。
-    """
     try:
         with open("/proc/cpuinfo") as f:
             for line in f:
@@ -178,31 +128,14 @@ def taskset_cpus(proc_idx: int) -> str:
 def csv_str(xs) -> str:
     return ",".join(str(x) for x in xs)
 
-
-# ── env var 組裝 ─────────────────────────────────────────────────────────────
-
-
 def build_env_saps_q(tenant_id: int, n_tenants: int, n_paths: int,
                       link_cap: int, weights: list,
                       path_caps: list[int] | None = None,
                       bypass_d: str = "0") -> list:
-    """SAPS-Q mode:SAPSQ_ENABLED=1 → 走 sapsq_m_init() 新 2D enforcement path。
-
-    E2 coordinator/tenant 修正 (Lane AA):
+    """
       tenant_id == 0: DPA_PLUGIN_ROLE=coordinator
-        → dpa_plugin_init() 完整 path + alloc_ring_memfd + UDS server
       tenant_id > 0:  DPA_PLUGIN_ROLE=tenant
-        → uds_client_get_memfd() attach coordinator ring,不建 DPA process
 
-    修正內容 (vs Lane W broken version):
-      1. DPA_PLUGIN_ROLE: coordinator(proc 0) / tenant(proc 1-3);非 standalone
-      2. DPA_PLUGIN_SAMPLE_RATE: hardcode 1;非 env default 64 (event density 差 64×)
-      3. SAPSQ_BYPASS_SAPS_FSM=1: E2 skip SAPS B7 FSM cold-start degrade (同 e1)
-      4. DPA_PLUGIN_SOCK: 所有 proc 設同一 UDS path → coordinator 監聽 tenant 連接
-      5. DPA_PLUGIN_DEV: 從外部 DPA_PLUGIN_DEV env var 繼承(mlx5_0 / mlx5_1 lane)
-         sudo taskset ... env ... 命令行傳遞確保 sudo 不丟失此 var
-
-    env 對應 dpa_plugin.c:sapsq_m_init() (line 1250-1371):
       SAPSQ_ENABLED          → gates sapsq_m_init()
       SAPSQ_MY_TENANT_ID     → per-proc tenant id (0/1/2/3)
       SAPSQ_NUM_TENANTS      → sapsq_num_tenants
@@ -210,19 +143,12 @@ def build_env_saps_q(tenant_id: int, n_tenants: int, n_paths: int,
       SAPSQ_LINK_CAP_IOPS    → namespace service envelope
       SAPSQ_PATH_CAP_IOPS    → per-path deliverable capacities
       SAPSQ_EPOCH_PERIOD_US  → sapsq_epoch_period_us (1ms scheduler tick)
-      SAPSQ_WEIGHTS          → sapsq_tenant_weight[] (plain int list,不做 Q16.16)
-      SAPSQ_PROBE_RATE_IOPS  → probe_rate_budget_q32 換算用(host plugin 內部算 Q32)
-      SAPSQ_HOST_TSC_FREQ    → sapsq_host_tsc_freq(DPA scheduler tick period 換算必須)
 
-    舊 SAPS_Q_* envs(Q16/Q32 encoded)屬於舊 sapsq_epoch_commit 1D path,
-    sapsq_m_init() 完全不讀它們,已移除。
     """
     tsc_hz = detect_tsc_hz()
     fsm_bypass = os.environ.get("SAPSQ_BYPASS_SAPS_FSM", "1")
     coupling_mode = os.environ.get("SAPSQ_HEALTH_COUPLING_MODE", "")
     active_probe = bypass_d == "0" and fsm_bypass == "0"
-    # DPA_PLUGIN_DEV: 從外部 env 繼承(DPA_PLUGIN_DEV=mlx5_0 sudo -E python3 ...)
-    # sudo 不自動傳遞自訂 env var,必須顯式加入 env list 確保 bdevperf 能拿到
     dpa_dev = os.environ.get("DPA_PLUGIN_DEV", "")
     if path_caps is None:
         raise ValueError(
@@ -234,7 +160,6 @@ def build_env_saps_q(tenant_id: int, n_tenants: int, n_paths: int,
         )
 
     if tenant_id == 0:
-        # Coordinator: 完整 dpa_plugin_init() + alloc_ring_memfd + UDS server
         env = [
             "DPA_PLUGIN_ROLE=coordinator",
             f"DPA_PLUGIN_SOCK={DPA_PLUGIN_SOCK}",
@@ -297,7 +222,6 @@ def build_env_saps_q(tenant_id: int, n_tenants: int, n_paths: int,
             env.append(f"DPA_PLUGIN_DEV={dpa_dev}")
         return env
     else:
-        # Tenant (1/2/3): attach coordinator ring via UDS,不建 DPA process
         env = [
             "DPA_PLUGIN_ROLE=tenant",
             f"DPA_PLUGIN_SOCK={DPA_PLUGIN_SOCK}",
@@ -350,7 +274,6 @@ def effective_health_coupling_mode() -> str:
 
 
 def build_env_m3_v2_static(tenant_id: int, link_cap: int, weights: list) -> list:
-    """M3-v2 static 模式:SAPS_M4_ENABLED=1(舊 M4 host token bucket),靜態 per-tenant rate"""
     sample_rate = os.environ.get("DPA_PLUGIN_SAMPLE_RATE", "64")
     return [
         "DPA_PLUGIN_ROLE=standalone",
@@ -380,7 +303,6 @@ def build_env_host_saps(tenant_id: int) -> list:
 
 
 def build_env_stock_qd() -> list:
-    """stock 模式:DPA plugin 完全不 init"""
     return [
         "DPA_PLUGIN_DISABLE_INIT=1",
         "SAPS_Q_ENABLED=0",
@@ -405,12 +327,7 @@ def build_env(mode_cli: str, tenant_id: int, n_tenants: int, n_paths: int,
     else:
         raise ValueError(f"unknown mode: {mode_cli}")
 
-
-# ── 單一 bdevperf process 管理 ───────────────────────────────────────────────
-
-
 class TenantProcE2:
-    """E2-專用 bdevperf process:4-tenant × 3-path multipath topology。"""
 
     def __init__(self, tenant_id: int, args, out_dir: Path, logfile):
         self.tid = tenant_id
@@ -484,13 +401,8 @@ class TenantProcE2:
         return cmds
 
     def _cgroup_setup(self, pid: int):
-        """cgroup v2 freeze cgroup を作成して bdevperf PID を登録する。
-        SPDK reactor は SCHED_FIFO で動くため SIGSTOP が効かない。
-        cgroup freeze は kernel レベルで全スレッドを確実に停止する。
-        """
         try:
             os.makedirs(self._cgroup_path, exist_ok=True)
-            # cgroup.procs に TGID を書く(all threads が同じ cgroup に入る)
             with open(f"{self._cgroup_path}/cgroup.procs", "w") as f:
                 f.write(str(pid))
             self._log(f"cgroup setup: {self._cgroup_path} PID={pid}")
@@ -498,9 +410,7 @@ class TenantProcE2:
             self._log(f"[WARN] cgroup setup failed: {e} — freeze will fallback to SIGSTOP")
 
     def _cgroup_teardown(self):
-        """cgroup を削除する。プロセスを先に kill してから呼ぶこと。"""
         try:
-            # まず freeze を解除してからでないと rmdir できない
             freeze_path = f"{self._cgroup_path}/cgroup.freeze"
             if os.path.exists(freeze_path):
                 with open(freeze_path, "w") as f:
@@ -628,19 +538,6 @@ class TenantProcE2:
         return subprocess.Popen(cmd, stdout=self.logfp, stderr=self.logfp)
 
     def _find_bdevperf_tgid(self) -> int:
-        """bdevperf の TGID(= スレッドグループ leader の PID = 真の process PID)を返す。
-
-        SPDK bdevperf は多スレッド。self.proc.pid は Popen が返した TID であり、
-        bdevperf 起動後は reactor thread の TID になっている場合がある。
-        SIGSTOP を TID に送っても 1 スレッドしか止まらない。
-
-        正しい手順:
-        1. /proc/<self.proc.pid>/status から Tgid を読む
-           → Tgid = スレッドグループ leader PID = bdevperf の "真の" PID
-        2. SIGSTOP を Tgid に送る → 全スレッドが停止する
-
-        Fallback: /proc が読めない場合は self.proc.pid をそのまま使う。
-        """
         try:
             status_path = f"/proc/{self.proc.pid}/status"
             with open(status_path) as f:
@@ -857,14 +754,10 @@ class TenantProcE2:
 
 class PerTenantTimeseries(threading.Thread):
     """
-    每秒 poll arm-1 spdk_tenants.sock 的 per-tenant bdev iostat,
-    計算 1-second delta,寫到 out_dir/per_tenant_iops_timeseries.csv。
 
-    CSV 格式:
       ts,t0,t1,t2,t3
       0.0,100000,33000,33000,33000
       1.0,...
-    其中 t0..t3 = 每秒 IOPS delta。
     """
 
     def __init__(self, out_dir: Path, duration: int, logfile, n_tenants: int = 4,
@@ -880,13 +773,8 @@ class PerTenantTimeseries(threading.Thread):
         self._stop_evt = threading.Event()
         self._rows = []   # list of (elapsed_s, [t0, t1, t2, t3])
         self._initial_full = None
-        # 可選逐秒延遲 (latency) + per-path 收集 (--collect-latency)。
-        # 預設 False → 完全還原舊行為 (只收 path A IOPS),既有 caller 不受影響。
         self.collect_latency = collect_latency
-        # per-path IOPS timeseries (聚合 / 偵測導離壞路用):cols=[elapsed_s, A_t0..,B_t0..,C_t0..]
         self.perpath_file = out_dir / "per_path_iops_timeseries.csv"
-        # per-tenant 每秒延遲 (ns):avg = read_latency_ticks delta / read_ops delta,
-        # worst = max_read_latency_ticks (累計最大,非 per-second 重置;當 P99 proxy)
         self.latency_file = out_dir / "per_tenant_latency_timeseries.csv"
 
     def start(self):
@@ -895,9 +783,6 @@ class PerTenantTimeseries(threading.Thread):
         super().start()
 
     def _get_arm1_reads(self):
-        """從 arm-1 spdk_a.sock 讀 malloc_t0_A..t(N-1)_A 的 num_read_ops。
-        4t3p topology 下 path A (spdk_a.sock) 各 tenant bdev 名為 malloc_t{i}_A。
-        """
         import base64
         n = self.n_tenants
         script = (
@@ -932,7 +817,6 @@ class PerTenantTimeseries(threading.Thread):
             "print(json.dumps(results))\n"
         )
         b64 = base64.b64encode(script.encode()).decode()
-        # root 下 ssh arm-1 key 不通;用 sudo -u aiden ssh 借 aiden 的 key
         r = subprocess.run(
             [
              "sudo", "-u", "aiden", "ssh",
@@ -951,17 +835,6 @@ class PerTenantTimeseries(threading.Thread):
             return None
 
     def _get_arm1_full(self):
-        """收集全部 3 path × N tenant 的 num_read_ops + read_latency_ticks +
-        max_read_latency_ticks。一次 SSH 撈 spdk_a/b/c.sock 三個 bdev_get_iostat,
-        bdev 名為 delay_t{i}_{P}(延遲注入點,既含 read_ops 也含 latency_ticks)。
-
-        回傳 dict:
-          tsc_hz                         — arm-1 報告的 tsc_rate (ticks→ns 換算用)
-          reads[P][i]                    — 累計 num_read_ops
-          lat_ticks[P][i]                — 累計 read_latency_ticks
-          max_lat_ticks[P][i]            — max_read_latency_ticks(累計最大值)
-        撈失敗回 None。
-        """
         import base64
         n = self.n_tenants
         socks = {
@@ -1076,24 +949,17 @@ class PerTenantTimeseries(threading.Thread):
         log(f"timeseries written to {self.out_file}", self.logfile)
 
     def _run_with_latency(self):
-        """--collect-latency 模式:每秒收 3 path × N tenant 的 IOPS + latency。
-
-        同時寫三個 CSV:
+        """
           per_tenant_iops_timeseries.csv  — [elapsed_s, t0..t{N-1}]
-              每 tenant = 三 path read_ops delta 之和(聚合每秒 IOPS,軌跡主訊號)
           per_path_iops_timeseries.csv    — [elapsed_s, A_t0..A_t{N-1}, B_*, C_*]
-              per (path, tenant) read_ops delta(看 SAPS 多快把流量導離壞路 B)
           per_tenant_latency_timeseries.csv — [elapsed_s,
               t0_avg_ns..,t{N-1}_avg_ns, t0_worst_ns.., t{N-1}_worst_ns]
               avg = Σ_P Δread_latency_ticks / Σ_P Δread_ops × (1e9/tsc_hz)
               worst = max_P(max_read_latency_ticks) × (1e9/tsc_hz)
-                      (累計 worst-case，P99 的便宜 proxy)
         """
         n = self.n_tenants
         paths = self.paths
         start = time.time()
-        # 寫絕對 wall-clock 起點 (ms) 供 analyze_ftdyn.py 把 elapsed_s 軌跡對齊到
-        # d2_marks.log 的 D2_MARK *_ms 時戳 (兩者都是 epoch-ms 基準)。
         try:
             (self.out_file.parent / "collector_start_ms.txt").write_text(
                 str(int(start * 1000)))
@@ -1123,7 +989,6 @@ class PerTenantTimeseries(threading.Thread):
                     sample_dt = max(elapsed - prev_elapsed, 1e-6)
                     tsc_hz = full.get("tsc_hz") or prev.get("tsc_hz") or 1_000_000_000
                     ns_per_tick = 1e9 / tsc_hz if tsc_hz else 1.0
-                    # per-path delta + per-tenant 聚合
                     per_tenant_iops = [0] * n
                     path_row = []
                     for P in paths:
@@ -1303,9 +1168,9 @@ def parse_args():
                    help="disable health classification for an explicit ablation")
     p.add_argument("--no-bypass-d", dest="bypass_d", action="store_false")
     p.add_argument("--collect-latency", action="store_true", default=False,
-                   help="除每秒 IOPS 外，額外收 per-path IOPS + per-tenant avg/worst "
-                        "latency timeseries (ftdyn onset→recovery 軌跡用)。"
-                        "預設關閉，不影響既有 caller。")
+                   help="In addition to per-second IOPS, collect per-path IOPS and per-tenant avg/worst "
+                        "latency timeseries for ftdyn onset-to-recovery traces. "
+                        "Disabled by default; existing callers are unaffected.")
     p.add_argument("--dry-run", action="store_true",
                    help="print commands + envs, do not launch testbed")
     p.add_argument("--target-ip", type=str, default=None,
@@ -1335,10 +1200,6 @@ def parse_args():
 
 
 def print_dry_run(args):
-    """
-    --dry-run 模式:印出所有 mode 的 invocation 差異 + phase timing。
-    不跑 testbed,不 SSH。
-    """
     weights = [int(w) for w in args.weights.split(",")]
     n = args.num_tenants
 
@@ -1430,34 +1291,22 @@ def print_dry_run(args):
 
     print("\n--- Idle mechanism (--idle-method) ---")
     print("  delay_inject (default, recommended):")
-    print("    arm-1 target 端 bdev_delay_update_latency delay_t{tid}_{A,B,C} avg_read 10s")
-    print("    → bdevperf outstanding IO stall → QD=32 被填滿 → 不再 submit 新 IO")
-    print("    → host_submit_count[tid] 停止 increment → demand_iops[tid] EWMA 衰減到 0")
-    print("    → saps_q progressive_fill skip tid → work-conserving 重分配給 t0/t2/t3")
-    print("    Phase 3: restore latency to 27us → bdevperf IO 恢復 → demand 回升")
-    print("    驗證: bdev_delay_update_latency avg_read 10000000 → rc=0 (2026-05-28)")
+    print("    arm-1 target-side bdev_delay_update_latency delay_t{tid}_{A,B,C} avg_read 10s")
+    print("    -> bdevperf outstanding IO stalls -> QD=32 fills -> no new IO is submitted")
+    print("    -> host_submit_count[tid] stops incrementing -> demand_iops[tid] EWMA decays to 0")
+    print("    -> saps_q progressive_fill skips tid -> work-conserving redistribution to t0/t2/t3")
+    print("    Phase 3: restore latency to 27us -> bdevperf IO resumes -> demand rises")
+    print("    Verified: bdev_delay_update_latency avg_read 10000000 -> rc=0 (2026-05-28)")
     print("  cgroup (deprecated, fails on SCHED_FIFO SPDK reactor):")
     print("    echo 1 > /sys/fs/cgroup/bdevperf_sapsq_t{tid}/cgroup.freeze")
-    print("    Lane W E2 失敗原因: SPDK reactor SCHED_FIFO → cgroup freeze 無效")
+    print("    Lane W E2 failure reason: SPDK reactor SCHED_FIFO -> cgroup freeze ineffective")
 
     print("\n=== end dry run ===\n")
 
-
-# ── launch-race 偵測 + 單次嘗試 ───────────────────────────────────────────────
-
-
 def _run_is_valid(results: list, perform_walltime_s: float, duration: int,
                   idle_tenant: int = None):
-    """判定一次 attempt 是否為有效 run。回傳 (valid: bool, reason: str)。
-
-    INVALID 條件 (任一成立):
-      (a) 任一 tenant 的 parsed IOPS 為 None 或 <= 0
-          → perform_tests 沒產 IO/result (rep7 launch-race 症狀)
+    """
       (b) perform_tests phase wall-time < duration * MIN_WALLTIME_FRACTION
-          → RPC 在 launch 瞬間即退出 (rep7: 應 60s 卻 ~3s 返回)
-      (c) 任一 NON-idle tenant 的 IOPS < busy-tenant median 的 1%
-          → 誤中的 delay-injection (colliding process) 把非 idle tenant 壓成
-            ~個位數 IOPS,rep 仍 parse 成 valid(IOPS>0)但量測已被污染。
     """
     bad = [r["tenant_id"] for r in results
            if not r.get("iops") or float(r["iops"]) <= 0]
@@ -1494,12 +1343,6 @@ def _run_is_valid(results: list, perform_walltime_s: float, duration: int,
 
 
 def run_one_attempt(args, out_dir: Path, orch_log):
-    """執行一次完整 launch→perform→parse,並判定有效性。
-
-    回傳 (results, ts_out_file, valid, reason)。
-    每次 attempt 自建 procs 並在結束 (含失敗) 時 cleanup_all,讓 retry 從乾淨
-    狀態重來。arm-1 setup 不在此函式 — 它是 idempotent 的一次性步驟。
-    """
     procs = [TenantProcE2(i, args, out_dir, orch_log)
              for i in range(args.num_tenants)]
 
@@ -1531,7 +1374,6 @@ def run_one_attempt(args, out_dir: Path, orch_log):
                            for q in procs]
                 return results, None, False, f"t{p.tid} RPC socket timeout"
     else:
-        # coordinator (tid=0) 開 UDS server;tenant 需在 coordinator UDS ready 後才連
         coord = procs[0]
         log("launching coordinator (tenant 0)", orch_log)
         coord.start()
@@ -1725,9 +1567,6 @@ def main():
     else:
         log("skip arm-1 setup (--no-setup-arm1)", orch_log)
 
-    # ── retry loop: launch+perform+parse 為一個重試單元 ───────────────────────
-    # launch-race (rep collapse to None IOPS) 為暫態 harness 故障;tear down 整個
-    # rep 並重跑通常即可恢復。最多 MAX_RUN_ATTEMPTS 次。
     results = None
     ts_out_file = None
     for attempt in range(1, MAX_RUN_ATTEMPTS + 1):

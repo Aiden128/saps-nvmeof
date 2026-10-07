@@ -43,44 +43,26 @@
 #define DPA_PLUGIN_PATH_MAX   (1u << DPA_PLUGIN_PATH_LOG2)  /* 8 */
 #define DPA_PLUGIN_PATH_MASK  (DPA_PLUGIN_PATH_MAX - 1u)
 
-/* M2 streaming PCA: per-client PC vector count。對齊 spike N_CLIENTS=16,
- * client_id = qp_id & (M2_CLIENT_MAX - 1) hash 出來。 */
 #define M2_CLIENT_LOG2 4
 #define M2_CLIENT_MAX  (1u << M2_CLIENT_LOG2)  /* 16 */
 #define M2_CLIENT_MASK (M2_CLIENT_MAX - 1u)
 #define M2_FEATURE_DIM 8
 
-/* M2 Oja's rule learning rate η = 0.01 in Q16.16 (spike ETA_OJA=0.01)。
- * 655 / 65536 = 0.00999... (偏 0.055%,遠在 spike convergence tolerance). */
 #define M2_ETA_Q16 655
 
-/* M2 warmup sample count(snapshot baseline 之前先收的 events)。
- * Spike extremenoise K=8 converged_to_target_at = 1076 → round up 1100。 */
 #define M2_WARMUP_N 1100u
 
-/* M2 sub-sample rate:每 (1 << M2_SUBSAMPLE_LOG2) 個 event 才跑一次 Oja
- * update。每 IO amortized cost = ~113ns / 8 = 14ns,符合 245ns budget。 */
 #define M2_SUBSAMPLE_LOG2 3
 #define M2_SUBSAMPLE_MASK ((1u << M2_SUBSAMPLE_LOG2) - 1u)
 
-/* M3 WMM credit ledger:per-tenant credit refresh + decrement。Tenant 數
- * 對齊 spike A/B/C/D 都用 4,壓測上限 16。 */
 #define M3_TENANT_LOG2 4
 #define M3_TENANT_MAX  (1u << M3_TENANT_LOG2)  /* 16 */
 #define M3_TENANT_MASK (M3_TENANT_MAX - 1u)
 
-/* Burst credit cap (避免 idle tenant 累積 credit 把對手耗光,對齊 Caladan §3)。
- * 1000 IO worth in Q32.32 = 1000 × (1 << 32) */
 #define M3_BURST_CAP_Q32  ((int64_t)1000LL << 32)
 
-/* Δtsc clamp (避免極端 idle gap 觸發溢位),~67 ms @1.5 GHz */
 #define M3_DELTA_TSC_CAP  ((uint64_t)100000000ULL)
 
-/* ── SAPS-Q (2026-05-22): DPA-advised, host-enforced per-tenant/per-path scheduler
- *
- * Spec: specs/dm-research-redesign-20260522.md §4。Reuse M3 tenant max + DPA_PLUGIN
- * path max,不另起 dimension。Tenant/path 編號 alias 既有 M3 / per_qp_path 體系。
- */
 #define SAPSQ_TENANT_MAX  M3_TENANT_MAX        /* 16, alias M3_TENANT_MAX */
 #define SAPSQ_PATH_MAX    DPA_PLUGIN_PATH_MAX  /* 8,  alias DPA_PLUGIN_PATH_MAX */
 
@@ -92,16 +74,6 @@
 #define SAPSQ_MAX_TENANTS 16
 #define SAPSQ_MAX_PATHS   DPA_PLUGIN_PATH_MAX
 
-/* Health factor in Q16.16 (1.0 = 65536 = HEALTHY full capacity).
- * Mapping from D-classifier (redesign §4.2):
- *   HEALTHY        -> 1.0   * 65536 = 65536
- *   DEGRADING/ONSET-> 0.5   * 65536 = 32768  (caller multiplies by (1-tail_risk))
- *   DEGRADED       -> 0.3   * 65536 = 19660
- *   BIMODAL_TAIL   -> 0.4   * 65536 = 26214  (tail-penalty path)
- *   SPARSE_ERROR   -> SAPSQ_HEALTH_PROBE_Q16 (probe-only)
- *   PERPETUAL_SLOW -> SAPSQ_HEALTH_PROBE_Q16 (probe-only)
- *   EXCLUDED/quarantine -> 0
- * 絕對禁止使用 per_qp_path_capacity[] 做 health_factor (D8 self-reinforcing 已踩過). */
 #define SAPSQ_HEALTH_HEALTHY_Q16   ((uint32_t)(1u << 16))   /* 65536 */
 #define SAPSQ_HEALTH_PROBE_Q16     ((uint32_t)100u)         /* ε ~ 0.0015 */
 #define SAPSQ_HEALTH_QUARANTINE    ((uint32_t)0u)
@@ -364,24 +336,6 @@ struct dpa_plugin_shared {
 	volatile uint64_t saps_score_updates;
 	volatile uint64_t saps_healthy_full_bypass_count;
 
-	/* D4 trace instrumentation (2026-05-17) — per-path histograms maintained by
-	 * DPA inside update_state_machine().
-	 *
-	 * Goal: 量測 D4 場景下 path B (idx 1) 真實的 FSM dwell time + 分類分佈,
-	 * 取代之前 inference-based RCA。Histogram-only (not sequence) is sufficient
-	 * because the question is "why doesn't path B reach EXCLUDED" — answered by
-	 * state dwell distribution + dominant fault_type.
-	 *
-	 * Layout: [DPA_PLUGIN_PATH_MAX=8][buckets]. Path index matches existing
-	 * per_qp_path_* arrays. Host reads via mmap (no RPC needed).
-	 *
-	 * State buckets: 0=HEALTHY 1=DEGRADING 2=EXCLUDED 3=RECOVERING
-	 * Fault buckets: 0=HEALTHY 1=PERPETUAL_SLOW 2=SPARSE_ERROR 3=BIMODAL_TAIL
-	 *                4=FLAP 5=ONSET 6=QD_DRIFT 7=ANY_THREE_VOTE 8=SHARED_FATE
-	 *                9=PROPORTIONAL_THROTTLE
-	 *
-	 * Bumped once per update_state_machine() call (sampled output of classifier).
-	 * Single-QP D4 場景下 totals = path 上做過的 classification count。 */
 	volatile uint64_t d4_state_count[DPA_PLUGIN_PATH_MAX][4];
 	volatile uint64_t d4_fault_count[DPA_PLUGIN_PATH_MAX][10];
 	/* Transition matrix [from_state][to_state]. Diagonal entries count "no
@@ -408,25 +362,11 @@ struct dpa_plugin_shared {
 	 * SAPS_FAULT_* enum. Captured by wrapper via out-param. */
 	volatile uint64_t d4_raw_fault_count[DPA_PLUGIN_PATH_MAX][10];
 
-	/* M1 spike (2026-05-17): host 在 init 時依 SAPS_M1_SINGLE_STREAM
-	 * 環境變數寫 0/1。DPA process_event() 讀此 bit 決定要不要把
-	 * (qp_idx, path_idx) 全部 remap 到 (0, 0) 模擬跨 client 聚合。
-	 * 預設 0,不影響 M0/M2/M3 路徑。 */
 	volatile uint32_t saps_m1_single_stream;
 
-	/* M1 spike (2026-05-19): one-shot reset request。host 在 init 時若
-	 * SAPS_M1_SINGLE_STREAM=1 寫 1,DPA 在第一筆 event 時 memset g_path[0][0]
-	 * 然後清回 0,避免前一輪 run 的 EWMA / FSM 殘留 (跨 testbed rep 殘留
-	 * 而 Slice 31 idle-gap auto-heal 因 cell 間隔 < 60s 不會觸發)。 */
 	volatile uint32_t saps_m1_reset_request;
 	uint8_t pad_m1[64 - 2 * sizeof(uint32_t)];
 
-	/* ── M2 streaming PCA (Oja's rule) per-client state ────────────────────
-	 * 對應 specs/m2-dpa-implementation-plan-20260519.md §1。每 client 維護
-	 * 8-feature PC vector w_c (Q16.16 in int64),warmup 結束時 snapshot 成
-	 * baseline,之後算 cosine(w_c, w_baseline) 寫到 m2_pca_conf_q16 給 host
-	 * non-hot-path 做 entropy 三分類 (HEALTHY/INDIVIDUAL/JOINT)。M2 v1 只當
-	 * observability,不接 routing(defensive default)。 */
 	volatile uint32_t saps_m2_enabled;          /* 0=off (default), 1=run Oja */
 	volatile int64_t  m2_pca_w[16][8];          /* 1024 B — per-client PC */
 	volatile int64_t  m2_pca_w_baseline[16][8]; /* 1024 B — warmup snapshot */
@@ -435,11 +375,6 @@ struct dpa_plugin_shared {
 	volatile uint8_t  per_client_joint_verdict[16]; /* 16 B — host-written */
 	uint8_t pad_m2[64 - 16 - sizeof(uint32_t)];
 
-	/* ── M3 WMM credit ledger per-tenant state ──────────────────────────
-	 * 對應 specs/m3-dpa-implementation-plan-20260519.md §1.2。Tenant 對應
-	 * spike A/B/C/D 四 client(壓測場景延伸到 16)。Hot-path:每 IO complete
-	 * 跑一次 credit refresh + decrement(~5 ns 加總)。v1 只當 observability,
-	 * 不接 admission gate(out-of-scope v2 才接)。 */
 	volatile int64_t  m3_tenant_credits_q32[16];      /* 128 B — DPA writer */
 	volatile uint32_t m3_tenant_weights_q16[16];      /*  64 B — host writer */
 	volatile uint64_t m3_tenant_last_tsc[16];         /* 128 B — DPA writer */
@@ -454,28 +389,9 @@ struct dpa_plugin_shared {
 	volatile uint32_t m3_v3_freeze_gate;              /*   4 B — host: v3 use freeze[] flag */
 	uint8_t pad_m3[64 - 8 - 8 - 4 - 4 - 4 - 4 - 4];
 
-	/* M3 v3 (2026-05-20):per-tenant freeze flag。DPA 寫 1 表示 credit < 0,
-	 * host fast-path submit 之前 check,1 → spin-wait or yield。比 per_qp_tokens
-	 * 的 cumulative-credit gap 直接(後者在 credit=0 wrap 成 huge 不會 throttle)。 */
 	volatile uint8_t  m3_tenant_freeze[16];           /*  16 B — DPA writer, host reader */
 	uint8_t pad_m3_freeze[64 - 16];
 
-	/* ── M3 v2 (M4 namespace, 2026-05-20):in-DPA per-tenant token bucket。
-	 *
-	 * 取代 v1 (host SSH daemon, Jain 0.5216, 3.6s/tick RPC wall) 用獨立 Q16.16
-	 * fixed-point token bucket。 DPA RP process_event hot path 每事件 refresh
-	 * + consume,host admission_check 讀 m4_tenant_reject_flag 立刻 -EAGAIN。
-	 *
-	 * 避開 v2/v3 失敗 root cause:
-	 *   - 不碰 per_qp_tokens(過去 uint32 wrap 在 (credit-admitted) underflow → admit)
-	 *     → 用獨立 Q16.16 token counter
-	 *   - 不用 binary freeze flag(per-IO 翻太快 host 看不到 sticky)
-	 *     → 用 continuous Q16.16 token，refresh + consume 在同 hot path
-	 *   - 不走 immediate EAGAIN retry loop
-	 *     → host 回 -EAGAIN 後 SPDK queued_req 路徑,resubmit 跟著 completion poll
-	 *
-	 * Refresh rate: r_i = (w_i / Σw) × link_iops, refresh_per_tsc_q16 = r_i / tsc_freq × 2^16
-	 * Burst cap: BURST_FACTOR IOs worth (default 1000 IOs = 1000 << 16 in Q16.16) */
 	volatile uint32_t m4_v2_enabled;                      /*   4 B — host gate */
 	volatile uint32_t m4_my_tenant_id;                    /*   4 B — host writes per-proc */
 	uint8_t pad_m4_hdr[64 - 8];
@@ -503,68 +419,6 @@ struct dpa_plugin_shared {
 	volatile uint64_t m4_tenant_admit_count[M3_TENANT_MAX];    /* 128 B */
 	volatile uint64_t m4_tenant_reject_count[M3_TENANT_MAX];   /* 128 B */
 
-	/* ── M5 v3 DPA-side proactive DRR scheduler (2026-05-20) ──────────────
-	 *
-	 * Alt B design:DPA RP 每 process_event round 跑 Deficit Round Robin,
-	 * 把 per-tenant grant_count (monotonic) 往上推。Host admission_check
-	 * 比較 grant_count > consumed_count → atomic bump consumed → admit。
-	 * 不需要 winner ring,不需要 io_token,不改 hook signature。
-	 *
-	 * Work-conserving redistribution:若 tenant t 的 pending_io_count == 0
-	 * (idle), 本 round 的 deficit[t] 不清零(保留給下輪),而是把這一輪
-	 * 多出來的 deficit 標記成 idle,等 active tenant 下輪繼承。
-	 * 簡化實作:DPA 每 round 對 idle tenant 不消耗 deficit(已累積即保留);
-	 * active tenant 吃 deficit 的同時可以借:deficit cap = 2× quantum(最多
-	 * 借一輪),超過的部分截掉以保 O(1) per-IO 複雜度。
-	 *
-	 * Pending detection:host 每次 submit 時 atomic++ m5_tenant_pending[t],
-	 * DPA admit 時 atomic-- m5_tenant_pending[t]。DPA 看 pending > 0 = active。
-	 *
-	 * State layout:
-	 *   grant_count[t]    — DPA 累積發給 tenant t 的 IO 許可數 (uint64, monotonic)
-	 *   consumed_count[t] — host 累積消費的 IO 許可數 (uint64, atomic, host writer)
-	 *   deficit_q16[t]    — DPA per-tenant DRR deficit accumulator (Q16.16, int32)
-	 *   quantum_q16[t]    — DPA per-tenant quantum (weight × BASE_QUANTUM, Q16.16, uint32, host writes)
-	 *   pending[t]        — host 端 outstanding 未 admit IO 數 (uint32, host atomic writer)
-	 *   last_drr_tsc      — DPA 上次 DRR round 的 TSC (uint64, DPA writer)
-	 *   drr_round_count   — DPA 跑過的 DRR round 數 (uint64, observability)
-	 *
-	 * Admission check:
-	 *   tenant_id = m5_my_tenant_id
-	 *   if m5_tenant_grant_count[t] > m5_tenant_consumed_count[t]:
-	 *     __atomic_fetch_add(&m5_tenant_consumed_count[t], 1, __ATOMIC_ACQ_REL)
-	 *     m5_tenant_admit_count[t]++
-	 *     return 0
-	 *   else:
-	 *     m5_tenant_reject_count[t]++
-	 *     return -EBUSY  (SPDK queued_req)
-	 *
-	 * DRR scheduler (DPA process_event, time-driven via TSC delta):
-	 *   BASE_QUANTUM = m5_base_quantum_q16 (default 1000 IOs Q16.16 = 1000<<16)
-	 *   Each quantum_q16[t] = round(weight[t] / Σweight × BASE_QUANTUM_PER_ROUND)
-	 *   每次 elapsed_tsc > m5_drr_interval_tsc 時跑一輪 DRR:
-	 *     for t in 0..M5_TENANT_MAX-1:
-	 *       if pending[t] > 0 (active tenant):
-	 *         deficit[t] += quantum[t]
-	 *         grant = min(deficit[t] / cost_per_io_q16, pending[t])
-	 *         grant_count[t] += grant
-	 *         deficit[t] -= grant × cost_per_io_q16
-	 *         clamp deficit[t] to [0, 2×quantum[t]] (prevent unbounded accumulation)
-	 *       else (idle):
-	 *         deficit[t] += quantum[t]  // 保留累積,work-conserving 下輪多借
-	 *         clamp deficit[t] to [0, 2×quantum[t]]
-	 *
-	 * DRR interval 設計:每 ~1ms (1.5G tsc → 1.5M tsc/ms);與 v2 refill per-IO 不同,
-	 * DRR 是 time-sliced,避免 event-driven deadlock (v2 §2 root cause)。
-	 *
-	 * Env vars:
-	 *   SAPS_M5_DRR_ENABLED=1
-	 *   SAPS_M5_LINK_IOPS        (default 200000)
-	 *   SAPS_M5_WEIGHTS          "w0,w1,w2,..." (default "1,1,1,1")
-	 *   SAPS_M5_TENANT_ID        per-proc tenant id
-	 *   SAPS_M5_BASE_QUANTUM_IOS (default 1000, IOs per round per unit weight)
-	 *   SAPS_M5_DRR_INTERVAL_US  (default 1000 µs = 1 ms)
-	 */
 	volatile uint32_t m5_drr_enabled;                          /*   4 B — host gate */
 	volatile uint32_t m5_my_tenant_id;                         /*   4 B — host writes per-proc */
 	uint8_t pad_m5_hdr[64 - 8];
@@ -586,32 +440,6 @@ struct dpa_plugin_shared {
 	volatile uint64_t m5_tenant_reject_count[M3_TENANT_MAX];   /* 128 B — incremented at throttle */
 	volatile uint64_t m5_tenant_idle_rounds[M3_TENANT_MAX];    /* 128 B — DPA: rounds tenant was idle */
 	volatile uint64_t m5_tenant_work_conserved[M3_TENANT_MAX]; /* 128 B — DPA: rounds deficit redistributed */
-
-	/* ── SAPS-Q (2026-05-22): per-tenant × per-path scheduler ─────────────
-	 *
-	 * Spec: specs/dm-research-redesign-20260522.md §4。
-	 *
-	 * Plane split:
-	 *   - DPA RP writes: epoch, path_health, tenant_path_rate_q32, eligibility
-	 *   - Host writes:   config (weights, base IOPS, probe), token bucket state,
-	 *                    observability counters
-	 *
-	 * Stable-epoch publication protocol (DPA):
-	 *   1. write all sapsq_tenant_path_rate_q32[t][p] and sapsq_path_health[p]
-	 *   2. release fence (full memory barrier on DPA-RP)
-	 *   3. sapsq_epoch_commit = ++sapsq_epoch
-	 *   4. sapsq_last_epoch_tsc = current DPA-side TSC reference
-	 *
-	 * Stable-epoch read protocol (host admission_check):
-	 *   1. epoch_snapshot = sapsq_epoch_commit (acquire load)
-	 *   2. if (host_tsc - sapsq_last_epoch_tsc_host_view) > stale_tsc:
-	 *        fall back to M4 static rates  (host has its own tsc proxy
-	 *        because DPA TSC is not the same clock; see host code)
-	 *   3. otherwise refresh + consume against sapsq_tenant_path_rate_q32
-	 *
-	 * Anti-deadlock: token refresh is host-TSC-driven on every submit attempt,
-	 * not completion-driven (per redesign §4.4)。
-	 */
 
 	/* Gates + epoch interval (host writer at init) */
 	volatile uint32_t sapsq_enabled;                              /*   4 B — host gate */
@@ -741,14 +569,12 @@ enum dpa_saps_action {
 	DPA_SAPS_ACTION_UNSET      = 0xFF /* no verdict yet — fall through to stock */
 };
 
-/* M2 PCA joint-anomaly verdict (host-side entropy 三分類 寫到
- * per_client_joint_verdict[client_id])。M2 v1 只當 observability,不接 routing。 */
 enum dpa_m2_verdict {
-	DPA_M2_VERDICT_HEALTHY    = 0,   /* baseline cosine ≥ H_JOINT,正常 */
+	DPA_M2_VERDICT_HEALTHY    = 0,    
 	DPA_M2_VERDICT_INDIVIDUAL = 1,   /* entropy < log2(N/2),subset signature(K=1..8) */
-	DPA_M2_VERDICT_JOINT      = 2,   /* entropy ≈ log2(N),全災(K=16 pattern) */
-	DPA_M2_VERDICT_SUSPECT    = 3,   /* cosine in [H_JOINT, H_JOINT+δ] 邊界 */
-	DPA_M2_VERDICT_UNSET      = 0xFF /* warmup 未完成 */
+	DPA_M2_VERDICT_JOINT      = 2,    
+	DPA_M2_VERDICT_SUSPECT    = 3,    
+	DPA_M2_VERDICT_UNSET      = 0xFF  
 };
 
 /* v2 SAPS FSM state codes (§4.4 state machine). */
