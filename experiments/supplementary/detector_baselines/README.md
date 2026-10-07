@@ -1,4 +1,4 @@
-# baseline_v2: four campaigns
+# Detector-baseline campaigns
 
 Copy this directory to /mnt/nvme0n1p1/aiden/DPA/baseline_v2 on arm-2.
 Requires root, Python 3.10+, SPDK patched bdevperf/rpc.py, Bash, taskset, flock and tee; no new Python dependencies.

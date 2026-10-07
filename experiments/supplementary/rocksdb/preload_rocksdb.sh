@@ -1,7 +1,7 @@
 #!/bin/bash
 # e2_build_and_preload.sh — build the RocksDB DB once, then make all 3 per-path mallocs
 # byte-identical so the 3-path multipath device reads consistently under READ-ONLY mount.
-# variant: target on arm-2 itself via setup_rocksdb_targets.sh (10.0.0.2).
+# Variant: targets set up by setup_rocksdb_targets.sh (10.0.0.2).
 #
 # Strategy (no SPDK source change):
 #   Phase BUILD  : attach ONLY path A (single-path, no multipath merge) as /dev/nbd0,

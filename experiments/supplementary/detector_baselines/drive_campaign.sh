@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# driver for c1/c2/c3/c4; legacy detector mode remains available.
+# Driver for c1/c2/c3/c4; legacy detector mode remains available.
 
 set -euo pipefail
 
@@ -222,7 +222,7 @@ fi
     echo "path_capacities_iops=$PATH_CAPS"
     echo "service_limit_iops=$SERVICE_LIMIT"
     echo "hugepages_before=$HP_BEFORE hugepage_size_kib=$HP_SIZE_KIB reserved_pages=$HP_NOW"
-    echo "topology=arm-2 RDMA: target 10.0.0.2 mlx5_0; nvmf_tgt paths A/B/C ports 4430/4431/4432 cores 40-45"
+    echo "topology=target 10.0.0.2 mlx5_0; nvmf_tgt paths A/B/C ports 4430/4431/4432 cores 40-45"
 } > "$OUT/driver_provenance.txt"
 
 log "starting 3 local nvmf_tgt targets"

@@ -42,7 +42,7 @@ LEGACY_ARMS = ("saps_q", "fixed_threshold", "per_path_adaptive", "stock_round_ro
 DPA_ARMS = ("saps_q", "saps_binary", "health_only")
 ARMS = LEGACY_ARMS + ("saps_binary", "health_only", "host_saps")
 LABELS = {**{arm: arm for arm in ARMS}, "stock_round_robin": "stock round robin"}
-TOPOLOGY = ("arm-2; RDMA mlx5_0@10.0.0.2; single NQN "
+TOPOLOGY = ("3 paths; mlx5_0@10.0.0.2; single NQN "
             + NQN + "; shared NSID=1 UUID/NGUID; malloc->delay->error; "
             "A/B/C=4430/4431/4432; target cores40-45; tenant cores4-11; "
             "4 tenants weights3:1:1:1 QD32 4096B randread; aggregate path QoS")

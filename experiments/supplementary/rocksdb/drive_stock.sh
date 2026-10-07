@@ -1,8 +1,7 @@
 #!/bin/bash
-# drive_campaign.sh — RocksDB E2 rerun on arm-2 (2026-10-06).
+# drive_stock.sh — RocksDB stock round robin runs (2026-10-06).
 #
-# Target and initiator both run on arm-2: three nvmf_tgt processes (cores 40-45)
-# listen on arm-2's own 10.0.0.2 through mlx5_0 RDMA, and the SAPS
+# Three nvmf_tgt processes (cores 40-45) listen on 10.0.0.2 (mlx5_0), and the SAPS
 # initiator (spdk_tgt, core 4, DPA plugin) attaches to them as three paths.
 # Steps: provenance, hugepages, target setup, DB build + byte-identical preload,
 # smoke gate, then stock and dpa_full x healthy/D1/D3 x 3 reps.

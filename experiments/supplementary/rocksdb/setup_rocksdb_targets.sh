@@ -1,7 +1,7 @@
 #!/bin/bash
 # setup_arm1_e2_3malloc.sh — E2 target: 1 tenant × 3-path, per-path malloc+delay+error stack.
-# variant (2026-10-06): run on arm-2; target listens on arm-2's own
-# 10.0.0.2 (mlx5_0 RDMA). Cores 40-45 avoid the initiator reactor (core 4).
+# Variant (2026-10-06): targets listen on 10.0.0.2 (mlx5_0). Cores 40-45 avoid the
+# initiator reactor (core 4).
 #
 # WHY 3-malloc per-path (NOT the single shared malloc of setup_arm1_realapp_3path.sh):
 #   E2 needs PER-PATH fault injection (D1 5ms delay on path B only; D3 sct=2/sc=0x81 on

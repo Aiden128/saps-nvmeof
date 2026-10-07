@@ -1,6 +1,6 @@
 #!/bin/bash
 # drive_saps.sh — rerun only the evaluated SAPS profile (mode "saps") for the
-# RocksDB test, after drive_campaign.sh produced the stock rows.
+# RocksDB test, after drive_stock.sh produced the stock rows.
 # Smoke gate requires the M-series controller to initialize and to sample I/O.
 
 set -uo pipefail

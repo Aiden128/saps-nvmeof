@@ -1,8 +1,8 @@
 #!/bin/bash
 # run_e2_fault.sh — E2: RocksDB readrandom over 3-path NVMe-oF multipath, READ-ONLY,
 # with mid-run per-path fault on path B. Three modes × two faults × N reps.
-# variant (2026-10-06): initiator and target both on arm-2; target at
-# 10.0.0.2 (mlx5_0 RDMA, cores 40-45); db_bench pinned to cores 8-39.
+# Variant used for the RocksDB test (2026-10-06): targets at 10.0.0.2 (mlx5_0,
+# cores 40-45); db_bench pinned to cores 8-39.
 #
 # Preconditions:
 #   - arm-1: setup_arm1_e2_3malloc.sh already up (1 tenant × 3-path, per-path malloc+
