@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# driver wrapper for the detector-baseline campaign on arm-2.
+# driver for c1/c2/c3/c4; legacy detector mode remains available.
 
 set -euo pipefail
 
@@ -7,6 +7,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPDK_ROOT="${SPDK_ROOT:-/home/aiden/spdk}"
 HARNESS="$SCRIPT_DIR/run_competitor_fault_experiment.py"
 CAMPAIGN=""
+EXPERIMENT="legacy"
+REFERENCE=""
+HOST_PROOF_PATTERN=""
+CAPS_SET=0
 OUT=""
 PATH_CAPS="300000,300000,300000"
 SERVICE_LIMIT="900000"
@@ -22,10 +26,14 @@ LOCK_FD=9
 
 usage() {
     cat <<'USAGE'
-Usage: ./drive_campaign.sh --smoke|--full --out OUTPUT [options]
+Usage: ./drive_campaign.sh --campaign c1|c2|c3|c4 --smoke|--full --out OUTPUT [options]
+Omit --campaign to use the original detector matrix.
 
 Options:
-  --path-capacities-iops CSV   Default: 300000,300000,300000
+  --campaign c1|c2|c3|c4      Campaign matrix (default: legacy)
+  --reference-capacity-iops C  c1 fixed reference (default: 899983.2185078033)
+  --host-proof-pattern REGEX  Optional extra host activation log requirement
+  --path-capacities-iops CSV   c2/c4: 400000 x3; other modes: 300000 x3
   --service-limit-iops IOPS    Default: 900000
   --fixed-threshold-us USEC    Default: 500
   --poll-interval-s SEC        Default: 1
@@ -38,7 +46,10 @@ while [[ $# -gt 0 ]]; do
         --smoke) CAMPAIGN="smoke"; shift ;;
         --full) CAMPAIGN="full"; shift ;;
         --out) OUT="${2:?missing --out value}"; shift 2 ;;
-        --path-capacities-iops) PATH_CAPS="${2:?missing value}"; shift 2 ;;
+        --campaign) EXPERIMENT="${2:?missing campaign}"; shift 2 ;;
+        --reference-capacity-iops) REFERENCE="${2:?missing value}"; shift 2 ;;
+        --host-proof-pattern) HOST_PROOF_PATTERN="${2:?missing value}"; shift 2 ;;
+        --path-capacities-iops) PATH_CAPS="${2:?missing value}"; CAPS_SET=1; shift 2 ;;
         --service-limit-iops) SERVICE_LIMIT="${2:?missing value}"; shift 2 ;;
         --fixed-threshold-us) FIXED_THRESHOLD_US="${2:?missing value}"; shift 2 ;;
         --poll-interval-s) POLL_INTERVAL_S="${2:?missing value}"; shift 2 ;;
@@ -48,10 +59,41 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$EXPERIMENT" in
+    legacy|c1|c2|c3|c4) ;;
+    *) echo "unknown campaign: $EXPERIMENT" >&2; exit 2 ;;
+esac
+if [[ "$CAPS_SET" == 0 && ( "$EXPERIMENT" == c2 || "$EXPERIMENT" == c4 ) ]]; then
+    PATH_CAPS="400000,400000,400000"
+fi
 if [[ -z "$CAMPAIGN" || -z "$OUT" ]]; then
     usage >&2
     exit 2
 fi
+# Validate arguments before locking/reserving pages or starting any target.
+python3 -B - "$PATH_CAPS" "$SERVICE_LIMIT" "$REFERENCE" "$EXPERIMENT" "$COUNTER_HZ" "$POLL_INTERVAL_S" "$FIXED_THRESHOLD_US" "$HOST_PROOF_PATTERN" <<'PYARGS'
+import math, re, sys
+caps, limit, reference, experiment, counter, poll, threshold, proof = sys.argv[1:]
+values = [int(value) for value in caps.split(",")]
+if len(values) != 3 or any(value <= 0 or value % 1000 for value in values):
+    raise SystemExit("path capacities require three positive multiples of 1000")
+if int(limit) <= 0:
+    raise SystemExit("service limit must be positive")
+if experiment == "c3" and any(value * 3 != int(limit) for value in values):
+    raise SystemExit("c3 requires equal path capacities K_p=C/3 for the host reference")
+if experiment == "c1" and not reference and (values != [300000] * 3 or int(limit) != 900000):
+    raise SystemExit("custom c1 capacities require an explicit matching reference")
+if reference:
+    value = float(reference)
+    if not math.isfinite(value) or value <= 0 or experiment not in ("legacy", "c1"):
+        raise SystemExit("positive external reference is allowed only for c1/legacy")
+if counter and int(counter) <= 0:
+    raise SystemExit("counter frequency must be positive")
+if not (0 < float(poll) <= 1) or not math.isfinite(float(threshold)) or float(threshold) <= 0:
+    raise SystemExit("invalid poll interval/fixed threshold")
+if proof:
+    re.compile(proof)
+PYARGS
 if (( EUID != 0 )); then
     echo "drive_campaign.sh must run as root" >&2
     exit 1
@@ -175,6 +217,8 @@ fi
     echo "host=$(hostname)"
     echo "spdk_root=$SPDK_ROOT"
     echo "runtime_dir=$RUNTIME_DIR"
+    echo "experiment=$EXPERIMENT mode=$CAMPAIGN"
+    echo "reference_capacity_iops=${REFERENCE:-campaign-default}"
     echo "path_capacities_iops=$PATH_CAPS"
     echo "service_limit_iops=$SERVICE_LIMIT"
     echo "hugepages_before=$HP_BEFORE hugepage_size_kib=$HP_SIZE_KIB reserved_pages=$HP_NOW"
@@ -193,6 +237,7 @@ run_harness() {
     local cmd=(
         python3 -B "$HARNESS"
         --campaign "$campaign"
+        --experiment "$EXPERIMENT"
         --out "$out_dir"
         --runtime-dir "$RUNTIME_DIR"
         --registry "$REGISTRY"
@@ -201,6 +246,12 @@ run_harness() {
         --fixed-threshold-us "$FIXED_THRESHOLD_US"
         --poll-interval-s "$POLL_INTERVAL_S"
     )
+    if [[ -n "$REFERENCE" ]]; then
+        cmd+=(--reference-capacity-iops "$REFERENCE")
+    fi
+    if [[ -n "$HOST_PROOF_PATTERN" ]]; then
+        cmd+=(--host-proof-pattern "$HOST_PROOF_PATTERN")
+    fi
     if [[ -n "$COUNTER_HZ" ]]; then
         cmd+=(--counter-hz "$COUNTER_HZ")
     fi

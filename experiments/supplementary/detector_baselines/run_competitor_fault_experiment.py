@@ -24,7 +24,10 @@ from pathlib import Path
 
 from external_baseline_common import parse_io_paths, positive_float
 from runtime_common import SPDK_ROOT, rpc, spawn_recorded, stop_recorded
-from saps_env import process_env
+from saps_env import process_env, HOST_SAPS_PARITY_GAPS
+from campaign_matrix import campaign_cells
+from window_measurements import (capture_thread_stats, summarize_thread_stats,
+                                 summarize_per_io, cleanup_per_io)
 
 HERE = Path(__file__).resolve().parent
 CONTROLLER = Path("/mnt/nvme0n1p1/aiden/DPA/nvme-of-controller")
@@ -35,7 +38,9 @@ NQN = "nqn.2024-01.io.spdk:mptest"
 PORTS = {"A": "4430", "B": "4431", "C": "4432"}
 FIELDS = {"avg_read": "avg_read_latency", "p99_read": "p99_read_latency",
           "avg_write": "avg_write_latency", "p99_write": "p99_write_latency"}
-ARMS = ("saps_q", "fixed_threshold", "per_path_adaptive", "stock_round_robin")
+LEGACY_ARMS = ("saps_q", "fixed_threshold", "per_path_adaptive", "stock_round_robin")
+DPA_ARMS = ("saps_q", "saps_binary", "health_only")
+ARMS = LEGACY_ARMS + ("saps_binary", "health_only", "host_saps")
 LABELS = {**{arm: arm for arm in ARMS}, "stock_round_robin": "stock round robin"}
 TOPOLOGY = ("arm-2; RDMA mlx5_0@10.0.0.2; single NQN "
             + NQN + "; shared NSID=1 UUID/NGUID; malloc->delay->error; "
@@ -102,7 +107,8 @@ def provenance(args):
               "path_capacities_iops": args.path_capacities_iops,
               "service_limit_iops": args.service_limit_iops,
               "counter_hz": args.counter_hz or "plugin cntfrq_el0 autodetection",
-              "sample_rate": 32, "fixed_threshold_us": args.fixed_threshold_us,
+              "sample_rate": "32, or 16/32/64 in c4; per-run manifest is authoritative",
+              "experiment": args.experiment, "fixed_threshold_us": args.fixed_threshold_us,
               "poll_interval_s": args.poll_interval_s,
               "binary_matches_controller_HEAD": "unverified; fingerprints only"}
     firmware = CONTROLLER / "dpa-smart-initiator/flexio_build/samples/build/dpa_plugin/dev/dpa_plugin_app.a"
@@ -178,7 +184,8 @@ def configure_tenant(socket, arm):
         replies.append(rpc_cli(socket, "bdev_nvme_attach_controller", "-b", "mp",
                                "-t", "rdma", "-a", "10.0.0.2", "-s", port,
                                "-f", "ipv4", "-n", NQN, "--multipath", "multipath"))
-    policy = ["-p", "plugin"] if arm == "saps_q" else ["-p", "active_active", "-s", "round_robin"]
+    policy = (["-p", "plugin"] if arm in (*DPA_ARMS, "host_saps")
+              else ["-p", "active_active", "-s", "round_robin"])
     replies.append(rpc_cli(socket, "bdev_nvme_set_multipath_policy", "-b", "mpn1", *policy))
     # bdev_nvme_get_io_paths lists only paths with an I/O channel, and bdevperf has
     # none before perform_tests, so verify the attached controllers instead.
@@ -329,14 +336,17 @@ def validate_result(run_dir, arm, epoch, fault, restored, window, calibrated):
                                     "restoration_started_unix": end,
                                     "healthy_B_interval_mean_latency_median_us": baseline_latency,
                                     "max_observed_B_interval_mean_latency_us": max_latency}
-        manifested = max_latency >= max(1000, 2 * baseline_latency)
-        if arm == "saps_q":
+        # Preserve the legacy 1ms gate, but admit the new 500us sweep fault.
+        latency_gate = max(min(1000, 0.8 * fault["value_us"]), 2 * baseline_latency)
+        manifested = max_latency >= latency_gate
+        result["fault_evidence"]["manifestation_latency_gate_us"] = latency_gate
+        if arm in DPA_ARMS:
             sample = sampler_evidence(run_dir, epoch, onset, end)
             result["controller_health"] = sample
             manifested = manifested or sample["health_changed"]
         result["fault_manifested"] = manifested
         if not manifested:
-            raise RuntimeError(f"{arm}: no B latency >=max(1ms,2x healthy) or SAPS health drop; fault did not manifest")
+            raise RuntimeError(f"{arm}: no B latency >= {latency_gate}us or SAPS health drop; fault did not manifest")
         for action in real_actions:
             action["relative_to_actual_read_delay_onset_ms"] = (float(action["timestamp_unix"]) - onset) * 1000
         result["detection"] = {"B_actions_after_onset": [item for item in real_actions
@@ -345,6 +355,59 @@ def validate_result(run_dir, arm, epoch, fault, restored, window, calibrated):
                                "native_traffic_reroute_latency": None,
                                "note": "native delivered-IOPS collapse is not proof of rerouting"}
     return result
+
+
+def healthy_sampler_progress(run_dir, epoch, window):
+    values = [row for row in rows(run_dir / "controller_sampler.csv")
+              if epoch + window[0] <= float(row["unix_s"]) <= epoch + window[1]]
+    if len(values) < 2:
+        raise RuntimeError("healthy SAPS run lacks window telemetry")
+    consumed = [int(row["consumed_total"]) for row in values]
+    if max(consumed) <= min(consumed):
+        raise RuntimeError("healthy SAPS DPA consumed no window samples")
+    if any(not any(int(row[f"dem{i}"]) > 0 and int(row[f"bud{i}"]) > 0
+                   for row in values) for i in range(4)):
+        raise RuntimeError("healthy SAPS run lacks positive tenant demand/budgets")
+    return {"window_samples": len(values), "consumed_delta": max(consumed) - min(consumed)}
+
+
+def validate_profile_logs(run_dir, arm, sample_rate, args):
+    import re
+    proof = {}
+    for index in range(4):
+        text = (run_dir / f"tenant{index}.log").read_text(errors="replace")
+        if arm in DPA_ARMS:
+            if not re.search(rf"sample_rate={sample_rate}(?!\d)", text):
+                raise RuntimeError(f"t{index}: sample rate not confirmed in plugin log")
+            mode = {"saps_q": 0, "health_only": 1, "saps_binary": 2}[arm]
+            if index == 0 and not re.search(rf"health_coupling_mode={mode}(?!\d)", text):
+                raise RuntimeError(f"{arm}: coupling mode not confirmed in coordinator log")
+            proof[f"t{index}"] = {"sample_rate_confirmed": sample_rate, "expected_mode": mode}
+        elif arm == "host_saps":
+            match = re.search(args.host_proof_pattern, text, re.IGNORECASE | re.MULTILINE)
+            if not match:
+                raise RuntimeError(f"t{index}: host activation not confirmed; inspect log and --host-proof-pattern")
+            if re.search(r"dpa_plugin: (?:init start|tenant init ok)", text):
+                raise RuntimeError(f"t{index}: host run also initialized the DPA")
+            cp_file = run_dir / f"host_saps_cp_t{index}.log"
+            cp_text = cp_file.read_text(errors="replace") if cp_file.exists() else text
+            cp_rows = re.findall(r"host_saps CP epochs=(\d+).*?my_tid=(\d+)\s+rate_q32=\[([^]]+)\]", cp_text)
+            active_rows = [(int(epochs), int(tid), [int(x) for x in rates.split(",")])
+                           for epochs, tid, rates in cp_rows]
+            if not any(epochs > 0 and tid == index and any(rate > 0 for rate in rates)
+                       for epochs, tid, rates in active_rows):
+                raise RuntimeError(f"t{index}: no active host CP epochs/tenant budget evidence")
+            proof[f"t{index}"] = {"host_activation_log": match.group(0),
+                                    "control_plane_epochs_max": max(item[0] for item in active_rows),
+                                    "requested_tenants": 4, "requested_paths": 3,
+                                    "requested_C": args.service_limit_iops,
+                                    "parity_gaps": list(HOST_SAPS_PARITY_GAPS),
+                                    "control_plane_parity": "process-local host control; not proven equivalent to shared DPA ring"}
+        else:
+            if re.search(r"dpa_plugin: (?:init start|tenant init ok)", text):
+                raise RuntimeError(f"t{index}: stock arm initialized the DPA")
+            proof[f"t{index}"] = {"DPA_initialization": "absent"}
+    return proof
 
 
 def perform_report(path):
@@ -361,7 +424,8 @@ def perform_report(path):
     return report
 
 
-def run_one(args, run_id, arm, duration, fault_at, restore_at, window, reference, commit):
+def run_one(args, run_id, arm, duration, fault_at, restore_at, window, reference, commit,
+            fault_delay_us=5000, sample_rate=32, repeat=0):
     run_dir = args.out / run_id
     run_dir.mkdir()
     runtime = args.runtime_dir / run_id
@@ -371,25 +435,38 @@ def run_one(args, run_id, arm, duration, fault_at, restore_at, window, reference
         raise RuntimeError("initiator UNIX socket path too long")
     started, tenants = [], []
     fault = restored = None
+    busy_start = busy_end = None
+    per_io_enabled = args.experiment != "legacy"
     may_be_faulted = False
     manifest = {"arm": arm, "label": LABELS[arm], "duration_s": duration,
                 "fault_at_s": fault_at, "restore_at_s": restore_at,
-                "fault": "B path four delay fields 27->5000us" if fault_at is not None else "none",
+                "fault": f"B path four delay fields 27->{fault_delay_us}us" if fault_at is not None else "none",
+                "fault_delay_us": fault_delay_us if fault_at is not None else 0,
+                "sample_rate": sample_rate if arm in DPA_ARMS else None,
+                "requested_sample_rate": sample_rate, "repeat": repeat, "experiment": args.experiment,
+                "per_io_logging": per_io_enabled,
                 "measurement_window_s": window, "path_capacities_iops": args.path_capacities_iops,
                 "service_limit_iops": args.service_limit_iops,
                 "reference_capacity_iops": reference, "reference_is_calibrated": reference > 0,
-                "weights": [3, 1, 1, 1], "weight_enforcement": "SAPS only; other arms accounting only",
+                "weights": [3, 1, 1, 1],
+                "weight_enforcement": ("DPA weighted admission" if arm in DPA_ARMS else
+                                       "host parity unverified; inspect host evidence" if arm == "host_saps"
+                                       else "none; accounting entitlement only"),
                 "topology": TOPOLOGY, "tenant_environments": {}, "tenant_commands": {}}
     write_json(run_dir / "manifest.json", manifest)
 
     def launch(index):
         env = process_env(arm, index, runtime, run_dir, args.path_capacities_iops,
-                          args.service_limit_iops, args.counter_hz)
+                          args.service_limit_iops, args.counter_hz, sample_rate=sample_rate)
         first = 4 + index * 2
         cmd = ["taskset", "-c", f"{first}-{first+1}", str(BDEVPERF),
                "-m", hex((1 << first) | (1 << (first + 1))),
                "-r", str(sockets[index]), "--wait-for-rpc", "-g", "-s", "384",
                "-q", "32", "-o", "4096", "-w", "randread", "-t", str(duration), "-z", "-l"]
+        if per_io_enabled:
+            per_io_dir = run_dir / f"tenant_{index:02d}" / "per_io"
+            per_io_dir.mkdir(parents=True)
+            cmd += ["--per-io-log", str(per_io_dir)]
         manifest["tenant_environments"][f"t{index}"] = {key: value for key, value in env.items()
             if key.startswith(("DPA_PLUGIN_", "SAPSQ_", "SAPS_", "HOST_SAPS_"))}
         manifest["tenant_commands"][f"t{index}"] = cmd
@@ -402,7 +479,7 @@ def run_one(args, run_id, arm, duration, fault_at, restore_at, window, reference
         write_json(run_dir / "target_before.json", target_state(args, 27))
         launch(0)
         configurations = {"t0": configure_tenant(sockets[0], arm)}
-        if arm == "saps_q":
+        if arm in DPA_ARMS:
             deadline = time.monotonic() + 10
             while not (runtime / "dpa.sock").exists():
                 if tenants[0].poll() is not None or time.monotonic() >= deadline:
@@ -430,7 +507,11 @@ def run_one(args, run_id, arm, duration, fault_at, restore_at, window, reference
             if collector.poll() is not None or time.monotonic() >= epoch_mono - 1:
                 raise RuntimeError("collector path/policy preflight not ready before common epoch")
             time.sleep(0.1)
-        validate_collector_preflight(ready)
+        preflight = validate_collector_preflight(ready)
+        if per_io_enabled:
+            expected_hz = args.counter_hz or 1_000_000_000
+            if any(int(hz) != expected_hz for hz in preflight["tick_rates"].values()):
+                raise RuntimeError(f"per-IO counter frequency differs from iostat tick rates: {preflight['tick_rates']}")
         wait_until(epoch_mono, tenants + [collector])
         dispatch, workloads = [], []
         for index, socket in enumerate(sockets):
@@ -447,17 +528,32 @@ def run_one(args, run_id, arm, duration, fault_at, restore_at, window, reference
         write_json(run_dir / "manifest.json", manifest)
         if manifest["dispatch_skew_s"] > 0.5:
             raise RuntimeError("workload dispatch skew exceeds 0.5s")
+        scheduled = []
         if fault_at is not None:
-            wait_until(epoch_mono + fault_at, tenants + workloads + [collector])
-            may_be_faulted = True
-            fault = delay_b(args, 5000, run_dir, "inject")
-            if fault["updates"][0]["completed_unix"] > epoch + fault_at + 1:
-                raise RuntimeError("read-delay onset was more than 1s late")
-            if fault["readback"]["timestamp_unix"] >= epoch + window[0]:
-                raise RuntimeError("fault configuration/readback did not settle before measurement")
-            wait_until(epoch_mono + restore_at, tenants + workloads + [collector])
-            restored = delay_b(args, 27, run_dir, "restore")
-            may_be_faulted = False
+            scheduled += [(fault_at, "inject"), (restore_at, "restore")]
+        if args.experiment == "c3":
+            scheduled += [(window[0], "busy_start"), (window[1], "busy_end")]
+        for at, event in sorted(scheduled):
+            wait_until(epoch_mono + at, tenants + workloads + [collector])
+            if event == "inject":
+                may_be_faulted = True
+                fault = delay_b(args, fault_delay_us, run_dir, "inject")
+                if fault["updates"][0]["completed_unix"] > epoch + fault_at + 1:
+                    raise RuntimeError("read-delay onset was more than 1s late")
+                if fault["readback"]["timestamp_unix"] >= epoch + window[0]:
+                    raise RuntimeError("fault configuration/readback did not settle before measurement")
+            elif event == "restore":
+                restored = delay_b(args, 27, run_dir, "restore")
+                may_be_faulted = False
+            else:
+                snapshot = capture_thread_stats(sockets)
+                write_json(run_dir / f"{event}.json", snapshot)
+                if snapshot["capture_completed_unix_s"] > epoch + at + 1:
+                    raise RuntimeError(f"{event}: reactor snapshot more than 1s late")
+                if event == "busy_start":
+                    busy_start = snapshot
+                else:
+                    busy_end = snapshot
         while time.monotonic() < epoch_mono + duration + 15:
             if collector.poll() is not None and all(proc.poll() is not None for proc in workloads):
                 break
@@ -473,8 +569,31 @@ def run_one(args, run_id, arm, duration, fault_at, restore_at, window, reference
         write_json(run_dir / "workload_results.json", {
             f"t{i}": perform_report(run_dir / f"perform_t{i}.json") for i in range(4)})
         write_json(run_dir / "target_after.json", target_state(args, 27))
+        # Terminate only this cell's registered processes, allowing per-IO logs
+        # and host/DPA shutdown diagnostics to flush before percentile analysis.
+        stop_recorded(args.registry, only_pids=[proc.pid for proc in started])
+        for proc in started:
+            proc.wait(timeout=5)
         result = validate_result(run_dir, arm, epoch, fault, restored, window, reference > 0)
-        result["run_id"] = run_id
+        if per_io_enabled:
+            result["per_io"] = summarize_per_io(run_dir, epoch, window,
+                                                args.counter_hz or 1_000_000_000)
+            result["worst_tenant_p99_read_latency_us"] = result["per_io"]["worst_tenant_p99_read_latency_us"]
+            write_json(run_dir / "per_io_summary.json", result["per_io"])
+            result["profile_evidence"] = validate_profile_logs(run_dir, arm, sample_rate,
+                                                               args)
+            if arm in DPA_ARMS and fault is None:
+                result["controller_progress"] = healthy_sampler_progress(run_dir, epoch, window)
+        if args.experiment == "c3":
+            if busy_start is None or busy_end is None:
+                raise RuntimeError("placement run missing thread snapshots")
+            result["reactor"] = summarize_thread_stats(busy_start, busy_end)
+            result["busy_cycles_per_io"] = result["reactor"]["busy_cycles_per_io"]
+        result.update(run_id=run_id, experiment=args.experiment, repeat=repeat,
+                      fault_delay_us=fault_delay_us if fault_at is not None else 0,
+                      sample_rate=sample_rate if arm in DPA_ARMS else None, reference_capacity_iops=reference,
+                      reference_kind=("fixed calibration" if args.experiment in ("legacy", "c1")
+                                      else "configured service limit C"))
         write_json(run_dir / "metrics.json", result)
         print(f"{run_id}: valid, aggregate={result['aggregate_iops']:.1f} IOPS", flush=True)
         return result
@@ -490,6 +609,8 @@ def run_one(args, run_id, arm, duration, fault_at, restore_at, window, reference
             stop_recorded(args.registry, only_pids=[proc.pid for proc in started])
             for proc in started:
                 proc.wait(timeout=5)
+            if per_io_enabled:
+                cleanup_per_io(run_dir)
             for socket in [*sockets, runtime / "dpa.sock"]:
                 if socket.exists():
                     socket.unlink()
@@ -513,9 +634,36 @@ def signal_stop(signum, _frame):
     raise RuntimeError(f"received signal {signum}")
 
 
+SUMMARY_COLUMNS = ["run_id", "experiment", "repeat", "arm", "label", "fault_delay_us",
+                   "sample_rate", "aggregate_iops", "reference_capacity_iops", "reference_kind",
+                   "worst_tenant_fair_share", "worst_tenant_p99_read_latency_us",
+                   "busy_cycles_per_io", "fault_manifested", "status"]
+SUMMARY_COLUMNS += [f"{tenant}_{field}" for tenant in ("t0", "t1", "t2", "t3")
+                    for field in ("iops", "p99_us", "busy_cycles_per_io")]
+
+
+def write_summary(path, results):
+    with Path(path).open("w", newline="") as sink:
+        writer = csv.DictWriter(sink, fieldnames=SUMMARY_COLUMNS)
+        writer.writeheader()
+        for result in results:
+            row = {key: result.get(key, "") for key in SUMMARY_COLUMNS}
+            row["worst_tenant_fair_share"] = result["measurement"]["worst_tenant_fair_share"]
+            for tenant, value in result["measurement"]["per_tenant"].items():
+                row[f"{tenant}_iops"] = value["mean_iops"]
+            for tenant, value in result.get("per_io", {}).get("per_tenant", {}).items():
+                row[f"{tenant}_p99_us"] = value["p99_read_latency_us"]
+            for tenant, value in result.get("reactor", {}).get("per_tenant", {}).items():
+                row[f"{tenant}_busy_cycles_per_io"] = value["busy_cycles_per_io"]
+            writer.writerow(row)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--campaign", choices=("smoke", "full"), required=True)
+    parser.add_argument("--experiment", choices=("legacy", "c1", "c2", "c3", "c4"), default="legacy")
+    parser.add_argument("--reference-capacity-iops", type=positive_float)
+    parser.add_argument("--host-proof-pattern", default=r"host_saps active.*skipping dpa_plugin_init")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--runtime-dir", type=Path, required=True)
     parser.add_argument("--registry", type=Path, required=True)
@@ -527,8 +675,20 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("run with sudo -n bash drive_campaign.sh")
-    if args.service_limit_iops != sum(args.path_capacities_iops):
-        parser.error("service limit must equal the sum of path caps, giving every arm the same physical envelope")
+    if args.service_limit_iops <= 0:
+        parser.error("service limit must be positive; it is independent of provisioned path capacities")
+    if args.experiment == "c3" and any(cap * 3 != args.service_limit_iops for cap in args.path_capacities_iops):
+        parser.error("c3 host reference supports K_p=C/3 only; use matching equal path capacities")
+    if (args.experiment == "c1" and args.reference_capacity_iops is None
+            and (args.path_capacities_iops != [300000] * 3 or args.service_limit_iops != 900000)):
+        parser.error("custom c1 capacities require an explicit matching --reference-capacity-iops")
+    if args.reference_capacity_iops is not None and args.experiment not in ("legacy", "c1"):
+        parser.error("c2/c3/c4 use entitlement at C; external denominator is only for c1/legacy")
+    import re
+    try:
+        re.compile(args.host_proof_pattern)
+    except re.error as exc:
+        parser.error(f"invalid host proof pattern: {exc}")
     if args.poll_interval_s > 1 or (args.counter_hz is not None and args.counter_hz <= 0):
         parser.error("poll interval must be <=1s and counter frequency must be positive")
     args.out = args.out.resolve()
@@ -538,58 +698,70 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, signal_stop)
-    campaign = {"status": "running", "campaign": args.campaign, "runs": [],
+    campaign = {"status": "running", "campaign": args.campaign, "experiment": args.experiment, "runs": [],
                 "started_unix": time.time(), "topology": TOPOLOGY}
     write_json(args.out / "campaign.json", campaign)
     try:
         prov = provenance(args)
         write_json(args.out / "provenance.json", prov)
         reference = 0.0
-        if args.campaign == "smoke":
+        calibration_runs = 0
+        if args.experiment != "legacy":
+            reference = (args.reference_capacity_iops or 899983.2185078033
+                         if args.experiment == "c1" else float(args.service_limit_iops))
+            matrix = campaign_cells(args.experiment, args.campaign == "smoke")
+            write_json(args.out / "calibration.json", {
+                "reference_capacity_iops": reference,
+                "definition": "fixed supplied healthy calibration" if args.experiment == "c1"
+                              else "configured entitlement at C",
+                "source": (("explicit --reference-capacity-iops" if args.reference_capacity_iops else
+                            "2026-10-06 three healthy stock calibrations")
+                           if args.experiment == "c1" else "service-limit-iops"),
+                "fresh_calibration_runs": 0, "weights": [3, 1, 1, 1],
+                "fixed_across_all_cells": True})
+        elif args.campaign == "smoke":
             matrix = [("smoke_saps_q", "saps_q", 20, 5, 18, (8, 17)),
                       ("smoke_fixed_threshold", "fixed_threshold", 20, 5, 18, (8, 17))]
         else:
             calibrations = []
-            for repeat in range(1, 4):
+            calibration_runs = 0 if args.reference_capacity_iops else 3
+            for repeat in range(1, calibration_runs + 1):
                 result = run_one(args, f"calibration_{repeat}", "stock_round_robin", 60,
                                  None, None, (23, 49), 0, prov["controller_HEAD"])
                 calibrations.append(result["aggregate_iops"])
                 campaign["runs"].append(result)
                 write_json(args.out / "campaign.json", campaign)
-            reference = statistics.median(calibrations)
+            reference = args.reference_capacity_iops or statistics.median(calibrations)
             if not math.isfinite(reference) or reference <= 0:
                 raise RuntimeError("healthy calibration produced no finite positive reference")
             write_json(args.out / "calibration.json", {
                 "reference_capacity_iops": reference, "healthy_aggregate_iops": calibrations,
-                "definition": "median of 3 healthy stock aggregates; sum of per-tenant interval-weighted mean IOPS over t=23..49s",
+                "definition": ("explicit supplied fixed reference" if args.reference_capacity_iops else
+                               "median of 3 healthy stock aggregates; sum of per-tenant interval-weighted mean IOPS over t=23..49s"),
                 "fixed_across_all_fault_arms": True, "weights": [3, 1, 1, 1],
                 "path_capacities_iops": args.path_capacities_iops,
                 "service_limit_iops": args.service_limit_iops})
             matrix = [(f"r{repeat}_{arm}", arm, 60, 20, 50, (23, 49))
-                      for repeat in range(1, 4) for arm in ARMS]
+                      for repeat in range(1, 4) for arm in LEGACY_ARMS]
         campaign["reference_capacity_iops"] = reference or None
-        campaign["expected_runs"] = len(matrix) + (3 if args.campaign == "full" else 0)
-        for run_id, arm, duration, fault_at, restore_at, window in matrix:
-            result = run_one(args, run_id, arm, duration, fault_at, restore_at, window,
-                             reference, prov["controller_HEAD"])
+        campaign["expected_runs"] = len(matrix) + calibration_runs
+        write_json(args.out / "campaign.json", campaign)
+        for cell in matrix:
+            if isinstance(cell, tuple):
+                run_id, arm, duration, fault_at, restore_at, window = cell
+                cell = dict(run_id=run_id, arm=arm, duration=duration, fault_at=fault_at,
+                            restore_at=restore_at, window=window)
+            result = run_one(args, reference=reference, commit=prov["controller_HEAD"], **cell)
             campaign["runs"].append(result)
             write_json(args.out / "campaign.json", campaign)
         campaign.update(status="complete", finished_unix=time.time())
         write_json(args.out / "campaign.json", campaign)
-        with (args.out / "summary.csv").open("w", newline="") as sink:
-            writer = csv.DictWriter(sink, fieldnames=["run_id", "arm", "label", "aggregate_iops",
-                                      "reference_capacity_iops", "worst_tenant_fair_share", "fault_manifested"])
-            writer.writeheader()
-            for result in campaign["runs"]:
-                writer.writerow({"run_id": result["run_id"], "arm": result["arm"], "label": result["label"],
-                                 "aggregate_iops": result["aggregate_iops"],
-                                 "reference_capacity_iops": reference or "",
-                                 "worst_tenant_fair_share": result["measurement"]["worst_tenant_fair_share"],
-                                 "fault_manifested": result["fault_manifested"]})
+        write_summary(args.out / "summary.csv", campaign["runs"])
         return 0
     except BaseException as exc:
         campaign.update(status="invalid", error=str(exc), finished_unix=time.time())
         write_json(args.out / "campaign.json", campaign)
+        write_summary(args.out / "summary.csv", campaign["runs"])
         raise
 
 

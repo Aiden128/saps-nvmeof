@@ -62,7 +62,7 @@ CACHE_MB="${CACHE_MB:-8}"
 DIRECT_READS="${DIRECT_READS:-1}"
 REPS="${REPS:-3}"
 MODES="${MODES:-stock dpa_full}"
-FAULTS="${FAULTS:-healthy D1 D3}"
+FAULTS="${FAULTS:-healthy D1 P3}"
 OUTDIR="${OUTDIR:-$ROOT/experiments/realapp_nbd/e2_fault/run_$(date +%Y%m%d_%H%M%S)}"
 SMOKE="${SMOKE:-0}"               # SMOKE=1 → single rep, short duration, gate checks only
 
@@ -89,6 +89,7 @@ restore_pathB() {
     # sct=2/sc=0x81 (Unrecovered Read Error) → decimal sc=129. This silently broke D3 for every
     # prior run (inject rc=2, swallowed by || true) → no errors injected → SAPS saw nothing.
     rpcb "bdev_error_inject_nvme_error EE_delay_B clear --sct 2 --sc 129 -n 1" >/dev/null 2>&1 || true
+    rpcb "bdev_error_inject_nvme_error EE_delay_B clear --sct 3 --sc 0 -n 1" >/dev/null 2>&1 || true
 }
 
 # Inject the named fault on path B (arm-1).
@@ -111,6 +112,13 @@ inject_fault() {
             log "ERROR: D3 inject FAILED — $inj_out"; return 1
         fi
         log "  D3 inject armed OK"
+    elif [ "$f" = "P3" ]; then
+        # Path Related Status (SCT 3h), Internal Path Error (SC 00h) on path B reads.
+        log "INJECT P3: path B -> sct=3/sc=0x00 path errors on reads"
+        local inj_out
+        inj_out=$(rpcb "bdev_error_inject_nvme_error EE_delay_B read --sct 3 --sc 0 -n 100000000" 2>&1)
+        if [ $? -ne 0 ]; then log "ERROR: P3 inject FAILED - $inj_out"; return 1; fi
+        log "  P3 inject armed OK"
     else
         log "ERROR: unknown fault $f"; return 1
     fi
